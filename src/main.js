@@ -50,7 +50,7 @@ function say(category, force = false) {
   lastPhrase = text;
   bubble.textContent = text;
   bubble.classList.add("visible");
-  bubbleUntil = nowSec() + 2 + text.length * 0.05;
+  bubbleUntil = nowSec() + 3.5 + text.length * 0.08;
 }
 
 function hideBubble() {

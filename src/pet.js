@@ -1,11 +1,20 @@
 // Clawd's behaviour: state machine and physics. Units are CSS pixels and seconds.
-import { GRID_W, GRID_H } from "./sprite.js";
+import { GRID_W, GRID_H, SPINNER_LENGTH } from "./sprite.js";
 
 const GRAVITY = 2600;
 const WALK_SPEED = 42;
 const SLEEP_AFTER = 180;
 const ATTENTION_RADIUS = 360;
 const ATTENTION_TIME = 2.5;
+
+// Calm activities Clawd picks by himself: [state, min seconds, max seconds].
+const ACTIVITIES = [
+  ["read", 25, 60],
+  ["code", 25, 60],
+  ["think", 8, 15],
+  ["sleep", 25, 50],
+];
+const ACTIVITY_STATES = new Set(["read", "code", "think"]);
 
 const clamp = (v, lo, hi) => (hi < lo ? lo : v < lo ? lo : v > hi ? hi : v);
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -45,6 +54,13 @@ export class Pet {
     this.nextZ = 0;
     this.hangStart = 0;
     this.hangUntil = 0;
+    this.activityStart = 0;
+    this.activityUntil = 0;
+    this.nextActivity = now + 15;
+    this.nextActivityEvent = 0;
+    this.flipUntil = 0;
+    this.typingPause = 0;
+    this.napUntil = 0;
     this.cursor = null;
     this.hoverSince = 0;
     this.bounds = { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 };
@@ -124,6 +140,11 @@ export class Pet {
       case "sleep":
         this.stepGround(dt, now);
         break;
+      case "read":
+      case "code":
+      case "think":
+        this.stepActivity(now);
+        break;
     }
 
     if (this.hopActive) {
@@ -179,6 +200,14 @@ export class Pet {
     }
 
     if (this.state === "sleep") {
+      if (this.napUntil && now >= this.napUntil) {
+        this.napUntil = 0;
+        this.state = "idle";
+        this.nextAction = now + rand(2, 4);
+        this.hop(300);
+        this.fx.say("stretch");
+        return;
+      }
       if (now >= this.nextZ) {
         this.nextZ = now + 1.6;
         this.fx.spawn("zzz");
@@ -197,15 +226,17 @@ export class Pet {
     if (attention !== null) this.look = attention;
 
     if (now - this.lastInteraction > SLEEP_AFTER && !this.hopActive && !this.walkIn) {
-      this.state = "sleep";
-      this.look = 0;
-      this.nextZ = now + 0.6;
+      this.goToSleep(now, 0);
       this.fx.hideBubble();
       return;
     }
 
     if (now < this.nextAction || this.hopActive || this.walkIn) return;
     this.nextAction = now + rand(3.5, 9);
+    if (now >= this.nextActivity && now - this.lastInteraction > 8 && Math.random() < 0.3) {
+      this.startActivity(now);
+      return;
+    }
     const roll = Math.random();
     if (roll < 0.38) {
       const distance = rand(40, 160) * pick([-1, 1]);
@@ -225,6 +256,92 @@ export class Pet {
     }
   }
 
+  startActivity(now) {
+    const [state, min, max] = pick(ACTIVITIES);
+    this.look = 0;
+    if (state === "sleep") {
+      this.goToSleep(now, now + rand(min, max));
+      this.fx.say("nap");
+      return;
+    }
+    this.state = state;
+    this.activityStart = now;
+    this.activityUntil = now + rand(min, max);
+    this.nextActivityEvent = now + rand(3, 6);
+    this.typingPause = 0;
+    this.fx.say(`${state}_start`);
+  }
+
+  // napUntil = 0 means sleep until someone wakes him up.
+  goToSleep(now, napUntil) {
+    this.state = "sleep";
+    this.look = 0;
+    this.napUntil = napUntil;
+    this.nextZ = now + 0.6;
+  }
+
+  stepActivity(now) {
+    const { maxY } = this.bounds;
+    if (this.y < maxY - 0.5) {
+      this.fall(0);
+      return;
+    }
+    this.y = Math.min(this.y, maxY);
+    this.updateHover(now);
+
+    if (now >= this.nextBlink) {
+      this.blinkUntil = now + 0.13;
+      this.nextBlink = now + rand(2.5, 6);
+    }
+
+    if (now >= this.activityUntil) {
+      this.finishActivity(now);
+      return;
+    }
+    if (now < this.nextActivityEvent) return;
+
+    switch (this.state) {
+      case "read":
+        this.nextActivityEvent = now + rand(4, 8);
+        this.flipUntil = now + 0.35;
+        if (Math.random() < 0.3) this.fx.say("read");
+        break;
+      case "code":
+        this.nextActivityEvent = now + rand(1.2, 2.6);
+        if (Math.random() < 0.25) this.typingPause = now + rand(1, 2.5);
+        if (Math.random() < 0.12) {
+          if (Math.random() < 0.35) {
+            this.setExpr("angry", 1.6, now);
+            this.fx.say("bug");
+          } else {
+            this.fx.say("code");
+          }
+        } else if (now >= this.typingPause) {
+          this.fx.spawn("code");
+        }
+        break;
+      case "think":
+        this.nextActivityEvent = now + rand(3, 5);
+        if (Math.random() < 0.4) this.fx.say("think");
+        break;
+    }
+  }
+
+  finishActivity(now) {
+    const state = this.state;
+    this.state = "idle";
+    this.nextAction = now + rand(2, 5);
+    this.nextActivity = now + rand(20, 45);
+    if (state === "think") {
+      this.hop(420);
+      this.setExpr("happy", 1.5, now);
+      for (let i = 0; i < 3; i++) this.fx.spawn("spark");
+      this.fx.say("idea");
+    } else {
+      this.fx.say(`${state}_end`);
+    }
+  }
+
   // Cursor resting on Clawd makes him happy and keeps him in place.
   updateHover(now) {
     const c = this.cursor;
@@ -236,6 +353,7 @@ export class Pet {
     this.lastInteraction = now;
     this.look = 0;
     this.nextAction = Math.max(this.nextAction, now + 1);
+    if (this.state !== "idle") return true;
     const busy = this.expr && this.expr !== "happy" && now < this.exprUntil;
     if (now - this.hoverSince > 0.6 && !busy) this.setExpr("happy", 0.3, now);
     return true;
@@ -353,6 +471,9 @@ export class Pet {
     let legs = "stand";
     let squash = 0;
     let blush = false;
+    let prop = null;
+    let spinner = -1;
+    let flip = false;
     const state = this.state;
     const walkLegs = () => (Math.floor(now * 7) % 2 ? "walk1" : "walk2");
 
@@ -365,6 +486,21 @@ export class Pet {
       look = 0;
     } else if (state === "sleep") {
       [eyes, arms, legs, look] = ["sleep", "tuck", "tuck", 0];
+    } else if (state === "read") {
+      // Eyes sweep along the lines, then jump back to the start of the next one.
+      [eyes, arms, prop] = ["down", "hold", "book"];
+      look = [-1, 0, 1][Math.floor(((now - this.activityStart) % 2.4) / 0.8)];
+      flip = now < this.flipUntil;
+    } else if (state === "code") {
+      prop = "laptop";
+      const typing = now >= this.typingPause;
+      arms = typing && Math.floor(now * 8) % 2 ? "type1" : "type2";
+      if (!typing) eyes = "up";
+      look = typing ? 0 : 1;
+    } else if (state === "think") {
+      eyes = "up";
+      look = Math.floor(now * 0.8) % 2 ? 1 : -1;
+      spinner = Math.floor(now * 8) % SPINNER_LENGTH;
     } else if (state === "walk") {
       legs = walkLegs();
     } else if (state === "press") {
@@ -391,11 +527,11 @@ export class Pet {
       if (this.expr === "happy") blush = true;
     }
     if (now < this.squashUntil && squash === 0) squash = 1;
-    if (eyes === "open" && ["idle", "walk", "hang"].includes(state) && now < this.blinkUntil) {
-      eyes = "blink";
-    }
+    const canBlink = ["idle", "walk", "hang", "code", "think"].includes(state);
+    if (now < this.blinkUntil && (eyes === "open" || eyes === "up") && canBlink) eyes = "blink";
     if (legs === "tuck" && squash) squash = 0;
-    return { eyes, look, arms, legs, squash, blush };
+    const cap = state === "sleep";
+    return { eyes, look, arms, legs, squash, blush, prop, cap, spinner, flip };
   }
 
   rotation(now) {
@@ -411,6 +547,7 @@ export class Pet {
 
   pointerDown(x, y, now) {
     const wasSleeping = this.state === "sleep";
+    const interrupted = ACTIVITY_STATES.has(this.state) ? this.state : null;
     this.lastInteraction = now;
     this.y += this.hopOff;
     this.hopActive = false;
@@ -430,9 +567,14 @@ export class Pet {
       vx: 0,
     };
     this.state = "press";
+    this.napUntil = 0;
+    if (interrupted) this.nextActivity = now + rand(20, 45);
     if (wasSleeping) {
       this.setExpr("surprised", 0.9, now);
       this.fx.say("wake");
+    } else if (interrupted) {
+      this.setExpr("surprised", 0.7, now);
+      this.fx.say(`${interrupted}_stop`, true);
     }
   }
 
