@@ -3,20 +3,20 @@ from pathlib import Path
 
 from PIL import Image
 
-BODY = (0xD9, 0x77, 0x57, 255)
-EYE = (0x1A, 0x1A, 0x1A, 255)
+BODY = (0xD7, 0x77, 0x57, 255)
+EYE = (0x00, 0x00, 0x00, 255)
 GRID = 18
 
 # (x0, y0, x1, y1, color) in grid cells, same as the idle frame in src/sprite.js.
 RECTS = [
-    *[(c, 10, c + 1, 12, BODY) for c in (4, 6, 11, 13)],
-    (1, 6, 3, 8, BODY),
-    (15, 6, 17, 8, BODY),
-    (3, 3, 15, 10, BODY),
-    (6, 5, 7, 7, EYE),
-    (11, 5, 12, 7, EYE),
+    *[(c, 11, c + 1, 13, BODY) for c in (4, 6, 11, 13)],
+    (1, 7, 3, 9, BODY),
+    (15, 7, 17, 9, BODY),
+    (3, 3, 15, 11, BODY),
+    (5, 5, 6, 7, EYE),
+    (12, 5, 13, 7, EYE),
 ]
-TOP_PAD = 3
+TOP_PAD = 2
 
 
 def render(size: int) -> Image.Image:

@@ -1,9 +1,10 @@
-// Pixel-art Clawd, ported from the exteraGram plugin. Coordinates are in grid units.
+// Pixel-art Clawd. Coordinates are in grid units; the idle frame matches the Clawd logo
+// from the Claude Code CLI banner (quadrant blocks mapped to 1x2 grid cells).
 export const GRID_W = 18;
 export const GRID_H = 13;
 
-export const BODY_COLOR = "#d97757";
-export const EYE_COLOR = "#1a1a1a";
+export const BODY_COLOR = "#d77757";
+export const EYE_COLOR = "#000000";
 
 const PARTICLE_COLORS = {
   heart: "#ff5c7a",
@@ -48,7 +49,7 @@ export function drawPet(ctx, frame, s) {
     ctx.fillRect(x0 * s, y0 * s, (x1 - x0) * s, (y1 - y0) * s);
   };
 
-  let [left, right, top, bottom] = [3, 15, 3, 10];
+  let [left, right, top, bottom] = [3, 15, 3, 11];
   if (squash > 0) [left, right, top] = [2, 16, 5];
   else if (squash < 0) [left, right, top] = [4, 14, 2];
   if (legs === "tuck") {
@@ -71,12 +72,12 @@ export function drawPet(ctx, frame, s) {
         px(right, top + 2, right + 1, top + 3, BODY_COLOR);
       }
     } else if (style === "tuck") {
-      if (side < 0) px(left - 1, top + 3, left, top + 5, BODY_COLOR);
-      else px(right, top + 3, right + 1, top + 5, BODY_COLOR);
+      if (side < 0) px(left - 1, bottom - 4, left, bottom - 2, BODY_COLOR);
+      else px(right, bottom - 4, right + 1, bottom - 2, BODY_COLOR);
     } else if (side < 0) {
-      px(left - 2, top + 3, left, top + 5, BODY_COLOR);
+      px(left - 2, bottom - 4, left, bottom - 2, BODY_COLOR);
     } else {
-      px(right, top + 3, right + 2, top + 5, BODY_COLOR);
+      px(right, bottom - 4, right + 2, bottom - 2, BODY_COLOR);
     }
   };
 
@@ -90,7 +91,7 @@ export function drawPet(ctx, frame, s) {
   px(left, top, right, bottom, BODY_COLOR);
 
   const ey = top + 2;
-  for (const [side, cx] of [[-1, left + 3 + look], [1, right - 4 + look]]) {
+  for (const [side, cx] of [[-1, left + 2 + look], [1, right - 3 + look]]) {
     switch (eyes) {
       case "blink":
         px(cx, ey + 1, cx + 1, ey + 2, EYE_COLOR);

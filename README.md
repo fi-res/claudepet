@@ -2,6 +2,7 @@
 
 Пиксельный Claude, который живёт поверх рабочего стола (Windows / Linux).
 Порт плагина `clawd_pet` для exteraGram/AyuGram на Rust + Tauri 2.
+Внешний вид и цвета — как у логотипа Clawd в Claude Code CLI.
 
 Сейчас Clawd умеет:
 
