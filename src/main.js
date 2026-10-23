@@ -159,6 +159,7 @@ listen("cursor", ({ payload }) => {
   updatePassthrough();
 });
 listen("recall", () => pet.recall(nowSec()));
+listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
 
 function tick(ms) {
   fitCanvas();

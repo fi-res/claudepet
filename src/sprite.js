@@ -16,6 +16,9 @@ const LAPTOP_LOGO = "#eef1f4";
 const CAP_COLOR = "#5b74c9";
 const POMPOM_COLOR = "#ffffff";
 const SPINNER_COLOR = "#eb8f6e";
+const PHONES_BAND = "#2b2b2b";
+const PHONES_CUP = "#3d3d3d";
+const PHONES_ACCENT = "#e6e6e6";
 
 // Thinking spinner beside the head, a nod to Claude Code's "✻ Thinking…".
 const SPINNER_FRAMES = [
@@ -33,6 +36,7 @@ const PARTICLE_COLORS = {
   zzz: "#8fa3bf",
   spark: "#ffc94d",
   code: "#7fd38a",
+  note: "#6fb8ff",
 };
 
 const PATTERNS = {
@@ -40,6 +44,7 @@ const PATTERNS = {
   zzz: ["XXXXX", "...X.", "..X..", ".X...", "XXXXX"],
   spark: ["..X..", "..X..", "XX.XX", "..X..", "..X.."],
   code: ["..X...X.X..", ".X....X..X.", "X....X....X", ".X..X....X.", "..X.X...X.."],
+  note: ["..XXXXX", "..X...X", "..X...X", "..X...X", "XXX.XXX", "XXX.XXX"],
 };
 
 function mix(a, b, t) {
@@ -66,7 +71,8 @@ const LEG_HEIGHTS = {
 
 // `s` is the size of one grid cell in device pixels.
 export function drawPet(ctx, frame, s) {
-  const { eyes, look, arms, legs, squash, blush, prop = null, cap = false, spinner = -1, flip = false } = frame;
+  const { eyes, look, arms, legs, squash, blush, prop = null, cap = false, phones = false, spinner = -1, flip = false } =
+    frame;
   ctx.clearRect(0, 0, GRID_W * s, GRID_H * s);
   const px = (x0, y0, x1, y1, color) => {
     ctx.fillStyle = color;
@@ -164,6 +170,7 @@ export function drawPet(ctx, frame, s) {
     }
   }
 
+  if (phones) drawPhones(px, left, right, top);
   if (prop === "book") drawBook(px, left, right, bottom, flip);
   else if (prop === "laptop") drawLaptop(px, left, right, bottom);
   if (cap) drawCap(px, left, right, top);
@@ -200,6 +207,17 @@ function drawLaptop(px, left, right, bottom) {
   const mid = (left + right) / 2;
   px(mid - 1, bottom - 2, mid + 1, bottom - 1, LAPTOP_LOGO);
   px(left, bottom + 1, right, bottom + 2, LAPTOP_EDGE);
+}
+
+// Over-ear headphones: band across the top of the head, cups on the sides.
+function drawPhones(px, left, right, top) {
+  px(left + 1, top - 2, right - 1, top - 1, PHONES_BAND);
+  px(left, top - 1, left + 1, top + 1, PHONES_BAND);
+  px(right - 1, top - 1, right, top + 1, PHONES_BAND);
+  px(left - 1, top + 1, left + 1, top + 4, PHONES_CUP);
+  px(right - 1, top + 1, right + 1, top + 4, PHONES_CUP);
+  px(left - 1, top + 2, left, top + 3, PHONES_ACCENT);
+  px(right, top + 2, right + 1, top + 3, PHONES_ACCENT);
 }
 
 // Nightcap leaning to the right, with a pompom.

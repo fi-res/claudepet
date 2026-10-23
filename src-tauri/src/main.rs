@@ -1,10 +1,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{thread, time::Duration};
+mod audio;
+
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use serde::Serialize;
 use tauri::{
-    menu::{Menu, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     App, AppHandle, Emitter, Manager, WebviewWindow,
 };
@@ -40,8 +49,12 @@ fn main() {
             // On Linux the native window must be realized (shown) before click-through can be set.
             window.show()?;
             window.set_ignore_cursor_events(true)?;
-            build_tray(app)?;
-            spawn_cursor_poller(window);
+            let listening = Arc::new(AtomicBool::new(true));
+            build_tray(app, listening.clone())?;
+            spawn_cursor_poller(window.clone());
+            audio::spawn(listening, move |event| {
+                let _ = window.emit_to(WINDOW, "audio", event);
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -116,12 +129,13 @@ fn spawn_cursor_poller(window: WebviewWindow) {
     });
 }
 
-fn build_tray(app: &App) -> tauri::Result<()> {
+fn build_tray(app: &App, listening: Arc<AtomicBool>) -> tauri::Result<()> {
     let recall = MenuItem::with_id(app, "recall", "Позвать Clawd", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Спрятать", true, None::<&str>)?;
+    let listen = CheckMenuItem::with_id(app, "listen", "Слушать звук", true, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&recall, &toggle, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&recall, &toggle, &listen, &separator, &quit])?;
 
     let mut tray = TrayIconBuilder::with_id("clawd")
         .tooltip("Clawd")
@@ -141,6 +155,10 @@ fn build_tray(app: &App) -> tauri::Result<()> {
                 .and_then(|w| w.is_visible().ok())
                 .unwrap_or(false);
             set_visible(app, &toggle, !visible);
+        }
+        "listen" => {
+            let on = listen.is_checked().unwrap_or(true);
+            listening.store(on, Ordering::Relaxed);
         }
         "quit" => app.exit(0),
         _ => {}

@@ -61,6 +61,14 @@ export class Pet {
     this.flipUntil = 0;
     this.typingPause = 0;
     this.napUntil = 0;
+    this.music = false;
+    this.musicReacted = false;
+    this.phones = false;
+    this.nextMusicSwitch = 0;
+    this.beatAt = -10;
+    this.beatCount = 0;
+    this.nextNote = 0;
+    this.lastStartle = 0;
     this.cursor = null;
     this.hoverSince = 0;
     this.bounds = { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 };
@@ -145,6 +153,9 @@ export class Pet {
       case "think":
         this.stepActivity(now);
         break;
+      case "dance":
+        this.stepDance(now);
+        break;
     }
 
     if (this.hopActive) {
@@ -215,6 +226,12 @@ export class Pet {
       return;
     }
 
+    if (this.updateMusic(now)) return;
+    if (this.music && this.phones && now >= this.nextNote) {
+      this.nextNote = now + rand(1.2, 2);
+      this.fx.spawn("note");
+    }
+
     if (now >= this.nextBlink) {
       this.blinkUntil = now + 0.13;
       this.nextBlink = now + (Math.random() < 0.15 ? 0.35 : rand(2, 5.5));
@@ -225,7 +242,7 @@ export class Pet {
     const attention = this.attention(now);
     if (attention !== null) this.look = attention;
 
-    if (now - this.lastInteraction > SLEEP_AFTER && !this.hopActive && !this.walkIn) {
+    if (now - this.lastInteraction > SLEEP_AFTER && !this.music && !this.hopActive && !this.walkIn) {
       this.goToSleep(now, 0);
       this.fx.hideBubble();
       return;
@@ -257,7 +274,8 @@ export class Pet {
   }
 
   startActivity(now) {
-    const [state, min, max] = pick(ACTIVITIES);
+    // No naps while music is playing.
+    const [state, min, max] = pick(this.music ? ACTIVITIES.filter(([name]) => name !== "sleep") : ACTIVITIES);
     this.look = 0;
     if (state === "sleep") {
       this.goToSleep(now, now + rand(min, max));
@@ -275,6 +293,8 @@ export class Pet {
   // napUntil = 0 means sleep until someone wakes him up.
   goToSleep(now, napUntil) {
     this.state = "sleep";
+    this.phones = false;
+    this.musicReacted = false;
     this.look = 0;
     this.napUntil = napUntil;
     this.nextZ = now + 0.6;
@@ -288,6 +308,7 @@ export class Pet {
     }
     this.y = Math.min(this.y, maxY);
     this.updateHover(now);
+    this.updateMusic(now);
 
     if (now >= this.nextBlink) {
       this.blinkUntil = now + 0.13;
@@ -340,6 +361,109 @@ export class Pet {
     } else {
       this.fx.say(`${state}_end`);
     }
+  }
+
+  onAudio(event, now) {
+    if (event.kind === "music") {
+      this.music = event.playing;
+    } else if (event.kind === "beat") {
+      this.beatAt = now;
+      this.beatCount++;
+      if (this.state === "dance" && event.strength > 4 && Math.random() < 0.2) this.hop(300);
+    } else if (event.kind === "loud") {
+      this.startle(now);
+    }
+  }
+
+  startle(now) {
+    if (this.state === "sleep") {
+      this.napUntil = 0;
+      this.state = "idle";
+      this.lastInteraction = now;
+      this.nextAction = now + rand(2, 4);
+      this.setExpr("surprised", 1.4, now);
+      this.hop(520);
+      this.fx.say("loud_wake", true);
+      return;
+    }
+    const calm = ["idle", "walk", "read", "code", "think", "dance"].includes(this.state);
+    if (!calm || now - this.lastStartle < 8) return;
+    this.lastStartle = now;
+    this.setExpr("surprised", 0.8, now);
+    this.squashUntil = now + 0.15;
+    this.hop(300);
+    if (Math.random() < 0.5) this.fx.say("loud");
+  }
+
+  // Reacts to music starting, switching between dancing and listening, and stopping.
+  // Returns true when it changed what Clawd is doing this tick.
+  updateMusic(now) {
+    if (!this.music) {
+      if (!this.musicReacted) return false;
+      this.musicReacted = false;
+      const wasDancing = this.state === "dance";
+      if (wasDancing) {
+        this.state = "idle";
+        this.nextAction = now + rand(2, 4);
+      }
+      if (this.phones || wasDancing) this.fx.say("music_end");
+      this.phones = false;
+      return wasDancing;
+    }
+    if (!this.musicReacted) {
+      this.musicReacted = true;
+      this.nextMusicSwitch = now + rand(25, 50);
+      if (ACTIVITY_STATES.has(this.state)) {
+        this.phones = true;
+        this.fx.say("music_phones");
+      } else if (Math.random() < 0.5) {
+        this.startDance();
+      } else {
+        this.phones = true;
+        this.fx.say("music");
+      }
+      return true;
+    }
+    if (now >= this.nextMusicSwitch && (this.state === "idle" || this.state === "dance")) {
+      this.nextMusicSwitch = now + rand(25, 50);
+      if (this.state === "dance") {
+        this.state = "idle";
+        this.phones = true;
+        this.fx.say("music");
+      } else {
+        this.startDance();
+      }
+      return true;
+    }
+    return false;
+  }
+
+  startDance() {
+    this.state = "dance";
+    this.look = 0;
+    this.fx.say("music_dance");
+  }
+
+  stepDance(now) {
+    const { maxY } = this.bounds;
+    if (this.y < maxY - 0.5 && !this.hopActive) {
+      this.fall(0);
+      return;
+    }
+    this.y = Math.min(this.y, maxY);
+    this.updateHover(now);
+    if (this.updateMusic(now)) return;
+    if (now >= this.nextNote) {
+      this.nextNote = now + rand(0.6, 1.1);
+      this.fx.spawn("note");
+    }
+  }
+
+  // Real beats while the analyzer finds them, otherwise a steady 120 BPM.
+  beat(now) {
+    if (now - this.beatAt < 1.5) return { count: this.beatCount, since: now - this.beatAt };
+    const t = now * 2;
+    return { count: Math.floor(t), since: (t % 1) / 2 };
   }
 
   // Cursor resting on Clawd makes him happy and keeps him in place.
@@ -497,6 +621,14 @@ export class Pet {
       arms = typing && Math.floor(now * 8) % 2 ? "type1" : "type2";
       if (!typing) eyes = "up";
       look = typing ? 0 : 1;
+    } else if (state === "dance") {
+      const { count, since } = this.beat(now);
+      const odd = count % 2 === 1;
+      eyes = "happy";
+      arms = odd ? "wave1" : "wave2";
+      legs = odd ? "walk1" : "walk2";
+      squash = since < 0.12 ? 1 : 0;
+      look = odd ? 1 : -1;
     } else if (state === "think") {
       eyes = "up";
       look = Math.floor(now * 0.8) % 2 ? 1 : -1;
@@ -512,6 +644,12 @@ export class Pet {
     }
 
     if (this.walkIn && state === "idle") legs = walkLegs();
+    if (state === "idle" && this.phones && this.music) {
+      // Nodding along, eyes closed every few bars.
+      const { count, since } = this.beat(now);
+      if (since < 0.1) squash = 1;
+      if (count % 8 >= 6) eyes = "happy";
+    }
     if ((state === "idle" || state === "walk") && now < this.waveUntil) {
       arms = Math.floor(now * 5) % 2 ? "wave1" : "wave2";
     }
@@ -531,11 +669,16 @@ export class Pet {
     if (now < this.blinkUntil && (eyes === "open" || eyes === "up") && canBlink) eyes = "blink";
     if (legs === "tuck" && squash) squash = 0;
     const cap = state === "sleep";
-    return { eyes, look, arms, legs, squash, blush, prop, cap, spinner, flip };
+    const phones = this.phones && !cap;
+    return { eyes, look, arms, legs, squash, blush, prop, cap, phones, spinner, flip };
   }
 
   rotation(now) {
     if (this.state === "fly") return clamp(this.vx / 70, -25, 25);
+    if (this.state === "dance") {
+      const { count, since } = this.beat(now);
+      return (count % 2 ? 1 : -1) * (4 + 4 * Math.max(0, 1 - since * 4));
+    }
     if (this.state === "hang") return Math.sin((now - this.hangStart) * 3) * 6;
     if (this.expr === "dizzy" && now < this.exprUntil) return Math.sin(now * 10) * 7;
     if (this.state === "drag" && this.touch) {
@@ -547,7 +690,7 @@ export class Pet {
 
   pointerDown(x, y, now) {
     const wasSleeping = this.state === "sleep";
-    const interrupted = ACTIVITY_STATES.has(this.state) ? this.state : null;
+    const interrupted = ACTIVITY_STATES.has(this.state) || this.state === "dance" ? this.state : null;
     this.lastInteraction = now;
     this.y += this.hopOff;
     this.hopActive = false;
@@ -569,6 +712,7 @@ export class Pet {
     this.state = "press";
     this.napUntil = 0;
     if (interrupted) this.nextActivity = now + rand(20, 45);
+    if (interrupted === "dance") this.nextMusicSwitch = now + rand(3, 6);
     if (wasSleeping) {
       this.setExpr("surprised", 0.9, now);
       this.fx.say("wake");
@@ -685,7 +829,7 @@ export class Pet {
   }
 
   hop(strength) {
-    if (this.state !== "idle" && this.state !== "walk") return;
+    if (this.state !== "idle" && this.state !== "walk" && this.state !== "dance") return;
     this.hopActive = true;
     this.hopVy = -strength;
     if (this.hopOff > 0) this.hopOff = 0;

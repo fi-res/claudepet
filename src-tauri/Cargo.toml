@@ -11,6 +11,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.26"
+
 [profile.release]
 codegen-units = 1
 lto = true
