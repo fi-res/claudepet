@@ -1,6 +1,7 @@
 import { Pet } from "./pet.js";
 import { GRID_W, GRID_H, drawPet, particleCanvas } from "./sprite.js";
 import { PHRASES } from "./phrases.js";
+import { Brain } from "./brain.js";
 
 const UNIT = 5;
 const MAX_PARTICLES = 14;
@@ -23,9 +24,12 @@ let frameKey = null;
 let particles = 0;
 let lastPhrase = null;
 let bubbleUntil = 0;
+let bubbleImportant = false;
 
+const brain = new Brain(invoke);
 const pet = new Pet(UNIT, {
   say,
+  sayText,
   spawn,
   hideBubble,
 });
@@ -43,19 +47,35 @@ function fitCanvas() {
   frameKey = null;
 }
 
-function say(category, force = false) {
-  const phrases = PHRASES[category] || [category];
+// `vars` fill {placeholders}; lines that need a missing one are skipped.
+function say(category, force = false, vars = {}) {
+  if (category === "idle" && Math.random() < 0.75) {
+    const generated = brain.take();
+    if (generated) return sayText(generated, force);
+  }
+  const all = Array.isArray(category) ? category : PHRASES[category] || [category];
+  const usable = all.filter((p) => [...p.matchAll(/\{(\w+)\}/g)].every(([, k]) => vars[k]));
+  const phrases = usable.length ? usable : all;
   const options = phrases.filter((p) => p !== lastPhrase);
-  const text = pick(options.length ? options : phrases);
+  const text = pick(options.length ? options : phrases).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+  sayText(text, force);
+}
+
+// Forced lines (Claude's thoughts, reports) aren't talked over by idle chatter.
+function sayText(text, force = false) {
+  const now = nowSec();
+  if (!force && bubbleImportant && now < bubbleUntil) return;
   lastPhrase = text;
+  bubbleImportant = force;
   bubble.textContent = text;
   bubble.classList.add("visible");
-  bubbleUntil = nowSec() + 3.5 + text.length * 0.08;
+  bubbleUntil = now + 3.5 + text.length * 0.08;
 }
 
 function hideBubble() {
   bubble.classList.remove("visible");
   bubbleUntil = 0;
+  bubbleImportant = false;
 }
 
 function spawn(kind) {
@@ -160,8 +180,26 @@ listen("cursor", ({ payload }) => {
 });
 listen("recall", () => pet.recall(nowSec()));
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
+listen("claude", ({ payload }) => pet.onClaude(payload, nowSec()));
+listen("notice", ({ payload }) => say(payload.phrase, true));
+listen("context", ({ payload }) => {
+  const now = nowSec();
+  pet.onTyping(payload.kind === "typing" ? payload.kpm : null, now);
+  const app = brain.onContext(payload, now);
+  if (!app || !pet.canChat()) return;
+  brain.comment(pet, now, app).then((line) => {
+    if (line) sayText(line);
+    else if (Math.random() < 0.3) say("window", false, { app });
+  });
+});
+
+let nextRefill = 0;
 
 function tick(ms) {
+  if (ms / 1000 >= nextRefill) {
+    nextRefill = ms / 1000 + 1;
+    brain.maybeRefill(pet, ms / 1000);
+  }
   fitCanvas();
   pet.setArea(window.innerWidth, window.innerHeight);
   pet.step(ms / 1000);

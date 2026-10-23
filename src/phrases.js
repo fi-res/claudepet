@@ -44,4 +44,30 @@ export const PHRASES = {
   music_dance: ["Танцуем!", "Ух, качает!", "Это мой трек!"],
   music_end: ["Эх, закончилось", "Ещё!", "Хороший трек"],
   dance_stop: ["Эй, я танцую!", "Не сбивай ритм!"],
+  claude_start: ["Новая задача! Беру", "Принял, работаю", "Так, посмотрим…", "Погнали!"],
+  claude_done: ["Готово! Проверь {project}", "Закончил! Загляни в терминал", "Сделано, проверь результат", "Готово!"],
+  claude_wait: ["Claude ждёт тебя в {project}!", "Нужно твоё решение!", "Эй, там вопрос для тебя", "Claude ждёт ответа"],
+  work_stop: ["Не мешай, я помогаю Claude!", "Я работаю!", "Потом поиграем, я занят"],
+  window: ["О, {app}!", "Что там в {app}?", "Опять {app}?"],
+  typing_fast: ["Быстро печатаешь!", "Клавиатура дымится!", "Ого, какой темп", "Не сломай клавиши!"],
+  hooks_on: ["Подключился к Claude Code!", "Теперь я вижу, что делает Claude"],
+  hooks_off: ["Отключился от Claude Code", "Ладно, больше не подглядываю"],
+  hooks_error: ["Не смог настроить Claude Code…", "Что-то с settings.json…"],
+};
+
+// What Clawd says when Claude Code uses a tool; {detail} is the file, command or query.
+export const TOOL_PHRASES = {
+  Read: ["Читаю {detail}", "Изучаю {detail}", "Что тут в {detail}…"],
+  Edit: ["Правлю {detail}", "Чиню {detail}", "Меняю {detail}"],
+  MultiEdit: ["Правлю {detail}", "Перекраиваю {detail}"],
+  Write: ["Пишу {detail}", "Создаю {detail}"],
+  NotebookEdit: ["Правлю ноутбук {detail}"],
+  Bash: ["Запускаю {detail}", "$ {detail}", "Терминал: {detail}"],
+  Grep: ["Ищу «{detail}»", "Где же «{detail}»…"],
+  Glob: ["Ищу файлы {detail}", "Перебираю {detail}"],
+  WebSearch: ["Гуглю: {detail}", "Ищу в сети: {detail}"],
+  WebFetch: ["Читаю {detail}", "Заглядываю на {detail}"],
+  Task: ["Зову помощника: {detail}"],
+  Agent: ["Зову помощника: {detail}"],
+  default: ["Работаю…", "Так-так…", "Колдую…", "Почти…"],
 };

@@ -1,5 +1,6 @@
 // Clawd's behaviour: state machine and physics. Units are CSS pixels and seconds.
 import { GRID_W, GRID_H, SPINNER_LENGTH } from "./sprite.js";
+import { TOOL_PHRASES } from "./phrases.js";
 
 const GRAVITY = 2600;
 const WALK_SPEED = 42;
@@ -15,6 +16,9 @@ const ACTIVITIES = [
   ["sleep", 25, 50],
 ];
 const ACTIVITY_STATES = new Set(["read", "code", "think"]);
+const SESSION_TIMEOUT = 10 * 60;
+const TOOL_SAY_EVERY = 8;
+const FAST_TYPING_KPM = 250;
 
 const clamp = (v, lo, hi) => (hi < lo ? lo : v < lo ? lo : v > hi ? hi : v);
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -69,6 +73,14 @@ export class Pet {
     this.beatCount = 0;
     this.nextNote = 0;
     this.lastStartle = 0;
+    this.claudeSessions = new Map();
+    this.claudeWork = false;
+    this.nextToolSay = 0;
+    this.pendingReport = null;
+    this.reportAt = 0;
+    this.nextSessionSweep = 0;
+    this.fastTypingSince = 0;
+    this.lastTypingComment = -Infinity;
     this.cursor = null;
     this.hoverSince = 0;
     this.bounds = { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0 };
@@ -128,6 +140,17 @@ export class Pet {
 
     if (this.state === "press" && this.touch && now - this.touch.t0 >= 0.4) {
       this.startPet(now);
+    }
+    if (this.pendingReport && now >= this.reportAt) {
+      this.fx.sayText(this.pendingReport, true);
+      this.pendingReport = null;
+    }
+    if (now >= this.nextSessionSweep) {
+      this.nextSessionSweep = now + 5;
+      for (const [id, session] of this.claudeSessions) {
+        if (now - session.last > SESSION_TIMEOUT) this.claudeSessions.delete(id);
+      }
+      if (!this.claudeSessions.size && this.claudeWork && this.state === "code") this.finishActivity(now);
     }
 
     switch (this.state) {
@@ -227,6 +250,11 @@ export class Pet {
     }
 
     if (this.updateMusic(now)) return;
+    const settled = now - this.lastInteraction > 3 && !this.hopActive && !this.walkIn;
+    if (this.claudeSessions.size && this.state === "idle" && settled) {
+      this.startWork(now, false);
+      return;
+    }
     if (this.music && this.phones && now >= this.nextNote) {
       this.nextNote = now + rand(1.2, 2);
       this.fx.spawn("note");
@@ -242,7 +270,8 @@ export class Pet {
     const attention = this.attention(now);
     if (attention !== null) this.look = attention;
 
-    if (now - this.lastInteraction > SLEEP_AFTER && !this.music && !this.hopActive && !this.walkIn) {
+    const busy = this.music || this.claudeSessions.size > 0;
+    if (now - this.lastInteraction > SLEEP_AFTER && !busy && !this.hopActive && !this.walkIn) {
       this.goToSleep(now, 0);
       this.fx.hideBubble();
       return;
@@ -330,7 +359,9 @@ export class Pet {
       case "code":
         this.nextActivityEvent = now + rand(1.2, 2.6);
         if (Math.random() < 0.25) this.typingPause = now + rand(1, 2.5);
-        if (Math.random() < 0.12) {
+        if (this.claudeWork) {
+          if (now >= this.typingPause) this.fx.spawn("code");
+        } else if (Math.random() < 0.12) {
           if (Math.random() < 0.35) {
             this.setExpr("angry", 1.6, now);
             this.fx.say("bug");
@@ -350,6 +381,8 @@ export class Pet {
 
   finishActivity(now) {
     const state = this.state;
+    const quiet = this.claudeWork;
+    this.claudeWork = false;
     this.state = "idle";
     this.nextAction = now + rand(2, 5);
     this.nextActivity = now + rand(20, 45);
@@ -358,8 +391,103 @@ export class Pet {
       this.setExpr("happy", 1.5, now);
       for (let i = 0; i < 3; i++) this.fx.spawn("spark");
       this.fx.say("idea");
-    } else {
+    } else if (!quiet) {
       this.fx.say(`${state}_end`);
+    }
+  }
+
+  // Clawd is free to chat when he isn't held, flying or asleep.
+  canChat() {
+    return ["idle", "walk", "read", "code", "think", "dance"].includes(this.state);
+  }
+
+  startWork(now, announce) {
+    if (this.state === "sleep") {
+      this.napUntil = 0;
+      this.setExpr("surprised", 0.8, now);
+    }
+    if (this.held || ["fly", "hang"].includes(this.state)) return;
+    this.state = "code";
+    this.claudeWork = true;
+    this.look = 0;
+    this.activityStart = now;
+    this.activityUntil = Infinity;
+    this.nextActivityEvent = now + 0.5;
+    this.typingPause = 0;
+    if (this.music) this.phones = true;
+    if (announce) this.fx.say("claude_start", true);
+  }
+
+  onClaude(event, now) {
+    const sessions = this.claudeSessions;
+    const id = event.session;
+    const touch = () => {
+      const session = sessions.get(id) || { project: event.project };
+      session.last = now;
+      if (event.project) session.project = event.project;
+      sessions.set(id, session);
+    };
+    switch (event.kind) {
+      case "start":
+        touch();
+        this.lastInteraction = now;
+        this.startWork(now, true);
+        break;
+      case "tool": {
+        touch();
+        if (!this.claudeWork) this.startWork(now, false);
+        if (now < this.nextToolSay) break;
+        this.nextToolSay = now + TOOL_SAY_EVERY;
+        const templates = (event.detail && TOOL_PHRASES[event.tool]) || TOOL_PHRASES.default;
+        this.fx.say(templates, false, { detail: event.detail, tool: event.tool });
+        break;
+      }
+      case "thought":
+        if (sessions.has(id)) touch();
+        this.nextToolSay = now + TOOL_SAY_EVERY;
+        this.fx.sayText(event.text, true);
+        break;
+      case "attention":
+        touch();
+        this.waveUntil = now + 3;
+        if (this.state === "sleep") this.startle(now);
+        this.hop(400);
+        this.fx.say("claude_wait", true, { project: event.project });
+        break;
+      case "stop":
+        sessions.delete(id);
+        if (sessions.size) break;
+        if (this.claudeWork && this.state === "code") this.finishActivity(now);
+        this.claudeWork = false;
+        this.hop(520);
+        this.waveUntil = now + 2.5;
+        for (let i = 0; i < 3; i++) this.fx.spawn("spark");
+        this.fx.say("claude_done", true, { project: event.project });
+        this.reportAt = now + 3;
+        break;
+      case "report":
+        // Haiku's summary follows the "done!" line instead of replacing it.
+        if (now < this.reportAt) this.pendingReport = event.text;
+        else this.fx.sayText(event.text, true);
+        break;
+      case "end":
+        sessions.delete(id);
+        if (!sessions.size && this.claudeWork && this.state === "code") this.finishActivity(now);
+        break;
+    }
+  }
+
+  onTyping(kpm, now) {
+    if (kpm === null) return;
+    if (kpm < FAST_TYPING_KPM) {
+      this.fastTypingSince = 0;
+      return;
+    }
+    if (!this.fastTypingSince) this.fastTypingSince = now;
+    const sustained = now - this.fastTypingSince > 6;
+    if (sustained && now - this.lastTypingComment > 180 && this.canChat()) {
+      this.lastTypingComment = now;
+      this.fx.say("typing_fast");
     }
   }
 
@@ -718,8 +846,9 @@ export class Pet {
       this.fx.say("wake");
     } else if (interrupted) {
       this.setExpr("surprised", 0.7, now);
-      this.fx.say(`${interrupted}_stop`, true);
+      this.fx.say(this.claudeWork ? "work_stop" : `${interrupted}_stop`, true);
     }
+    this.claudeWork = false;
   }
 
   pointerMove(x, y, now) {
