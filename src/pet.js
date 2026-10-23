@@ -439,7 +439,7 @@ export class Pet {
         if (now < this.nextToolSay) break;
         this.nextToolSay = now + TOOL_SAY_EVERY;
         const templates = (event.detail && TOOL_PHRASES[event.tool]) || TOOL_PHRASES.default;
-        this.fx.say(templates, false, { detail: event.detail, tool: event.tool });
+        this.fx.say(templates, true, { detail: event.detail, tool: event.tool });
         break;
       }
       case "thought":

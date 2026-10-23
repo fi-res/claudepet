@@ -122,17 +122,11 @@ fn main() {
             }));
 
             let w = window.clone();
-            audio::spawn(toggles.listening.clone(), move |e| {
-                let _ = w.emit_to(WINDOW, "audio", e);
-            });
+            audio::spawn(toggles.listening.clone(), move |e| send(&w, "audio", e));
             let w = window.clone();
-            context::spawn(toggles.watching.clone(), move |e| {
-                let _ = w.emit_to(WINDOW, "context", e);
-            });
+            context::spawn(toggles.watching.clone(), move |e| send(&w, "context", e));
             let w = window.clone();
-            let hub = hooks::Hub::new(cli, workdir, toggles.llm.clone(), move |e| {
-                let _ = w.emit_to(WINDOW, "claude", e);
-            });
+            let hub = hooks::Hub::new(cli, workdir, toggles.llm.clone(), move |e| send(&w, "claude", e));
             if let Err(e) = hooks::serve(toggles.token.clone(), hub) {
                 eprintln!("Claude Code hook endpoint unavailable: {e}");
             }
@@ -142,6 +136,15 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Clawd");
+}
+
+/// Forwards an event to the page; with CLAWD_DEBUG set, also logs it to stderr.
+fn send<T: Serialize + Clone + std::fmt::Debug>(window: &WebviewWindow, event: &str, payload: T) {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEBUG.get_or_init(|| std::env::var_os("CLAWD_DEBUG").is_some()) {
+        eprintln!("[{event}] {payload:?}");
+    }
+    let _ = window.emit_to(WINDOW, event, payload);
 }
 
 #[cfg(target_os = "linux")]
