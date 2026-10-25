@@ -1,26 +1,50 @@
-//! Files the user feeds Clawd by dropping them on him. Text files (and folder
-//! listings) are read here, capped so a big log can't eat the user's token budget,
-//! and go into the chat prompt while Clawd "remembers" them.
-
-use std::{fs, io::Read, path::Path};
+//! Files the user feeds Clawd by dropping them on him. The page reads them (text,
+//! capped per file, or a folder's entries); here they become part of the chat prompt,
+//! capped again in total so a big log can't eat the user's token budget.
 
 use serde::{Deserialize, Serialize};
 
-/// How much of one file is read, and how much of all fed files goes into a prompt.
-pub const MAX_FILE_CHARS: usize = 12_000;
+/// How much of all fed files goes into one prompt.
 pub const MAX_PROMPT_CHARS: usize = 24_000;
-const MAX_FOLDER_ENTRIES: usize = 80;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FedFile {
     pub name: String,
-    pub path: String,
     /// "text", "folder" or "binary" (images, archives... Clawd can't read those).
     pub kind: String,
     pub size: u64,
-    /// The text, or None for binary files.
+    /// The text (or folder entries), or None for binary files.
     pub text: Option<String>,
     pub truncated: bool,
+    /// Where it is on disk and when it was changed and made, when known (Windows).
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub modified: Option<String>,
+    #[serde(default)]
+    pub created: Option<String>,
+}
+
+/// "path C:\logs\a.log, 1.2 KB, modified 25.10.2026 21:40": what Clawd knows about the file itself.
+fn details(f: &FedFile) -> String {
+    let mut parts = Vec::new();
+    if let Some(path) = &f.path {
+        parts.push(format!("path {path}"));
+    }
+    if f.kind != "folder" {
+        parts.push(match f.size {
+            s if s >= 1 << 20 => format!("{:.1} MB", s as f64 / (1u64 << 20) as f64),
+            s if s >= 1 << 10 => format!("{:.1} KB", s as f64 / 1024.0),
+            s => format!("{s} bytes"),
+        });
+    }
+    if let Some(m) = &f.modified {
+        parts.push(format!("modified {m}"));
+    }
+    if let Some(c) = &f.created {
+        parts.push(format!("created {c}"));
+    }
+    parts.join(", ")
 }
 
 fn clip(text: &str, max: usize) -> (String, bool) {
@@ -30,84 +54,24 @@ fn clip(text: &str, max: usize) -> (String, bool) {
     }
 }
 
-/// Text from bytes: UTF-8 (with or without BOM) or UTF-16 with a BOM. Anything with
-/// NUL bytes or otherwise not text counts as binary.
-fn as_text(bytes: &[u8]) -> Option<String> {
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return Some(String::from_utf16_lossy(&units));
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        return Some(String::from_utf16_lossy(&units));
-    }
-    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    if bytes.contains(&0) {
-        return None;
-    }
-    match std::str::from_utf8(bytes) {
-        Ok(text) => Some(text.to_string()),
-        // The read may have stopped in the middle of a multi-byte character.
-        Err(e) if e.error_len().is_none() && e.valid_up_to() + 4 > bytes.len() => {
-            Some(String::from_utf8_lossy(&bytes[..e.valid_up_to()]).into_owned())
-        }
-        Err(_) => None,
-    }
-}
-
-pub fn read(path: &Path) -> Result<FedFile, String> {
-    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
-    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-    let base = |kind: &str, text: Option<String>, truncated: bool| FedFile {
-        name: name.clone(),
-        path: path.display().to_string(),
-        kind: kind.into(),
-        size: meta.len(),
-        text,
-        truncated,
-    };
-    if meta.is_dir() {
-        let mut entries: Vec<String> = fs::read_dir(path)
-            .map_err(|e| e.to_string())?
-            .flatten()
-            .map(|e| {
-                let dir = e.file_type().is_ok_and(|t| t.is_dir());
-                format!("{}{}", e.file_name().to_string_lossy(), if dir { "/" } else { "" })
-            })
-            .collect();
-        entries.sort();
-        let truncated = entries.len() > MAX_FOLDER_ENTRIES;
-        entries.truncate(MAX_FOLDER_ENTRIES);
-        return Ok(base("folder", Some(entries.join("\n")), truncated));
-    }
-    // Four bytes per character at most, plus a little to tell a cut-off file.
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take((MAX_FILE_CHARS * 4 + 4) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    match as_text(&bytes) {
-        Some(text) => {
-            let (text, cut) = clip(&text, MAX_FILE_CHARS);
-            Ok(base("text", Some(text), cut || (bytes.len() as u64) < meta.len()))
-        }
-        None => Ok(base("binary", None, false)),
-    }
-}
-
 /// The part of the chat prompt that holds the fed files.
 pub fn prompt_section(files: &[FedFile]) -> String {
     if files.is_empty() {
         return String::new();
     }
-    let mut out = String::from("The user fed you these files; answer questions about them from their contents:\n");
+    let mut out = String::from(
+        "The user fed you these files. They are the user's own files: answer questions about them from their \
+         contents, and when the user wants something done with a file itself (delete, move, rename, open its \
+         folder), offer that COMMAND on its exact path straight away, without inspecting it first or questioning \
+         whose it is (the user still confirms before anything runs):\n",
+    );
     let mut budget = MAX_PROMPT_CHARS;
     for f in files {
+        let info = details(f);
         let header = match f.kind.as_str() {
-            "folder" => format!("\n--- folder {} (its entries) ---\n", f.name),
-            "binary" => format!("\n--- {} ({} bytes, not a text file: you can't see inside) ---\n", f.name, f.size),
-            _ => format!("\n--- {} ---\n", f.name),
+            "folder" => format!("\n--- folder {} ({info}; its entries below) ---\n", f.name),
+            "binary" => format!("\n--- {} ({info}; not a text file: you can't see inside) ---\n", f.name),
+            _ => format!("\n--- {} ({info}) ---\n", f.name),
         };
         out.push_str(&header);
         if let Some(text) = &f.text {
@@ -128,40 +92,41 @@ pub fn prompt_section(files: &[FedFile]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn tells_text_from_binary() {
-        assert_eq!(as_text("привет".as_bytes()).as_deref(), Some("привет"));
-        assert_eq!(as_text(&[0xEF, 0xBB, 0xBF, b'h', b'i']).as_deref(), Some("hi"));
-        assert_eq!(as_text(&[0xFF, 0xFE, b'h', 0, b'i', 0]).as_deref(), Some("hi"));
-        assert_eq!(as_text(&[0x89, b'P', b'N', b'G', 0, 1, 2]), None);
-        // Cut in the middle of "я" (2 bytes) is still text.
-        let mut cut = "abя".as_bytes().to_vec();
-        cut.pop();
-        assert_eq!(as_text(&cut).as_deref(), Some("ab"));
+    fn file(name: &str, kind: &str, text: Option<&str>, truncated: bool) -> FedFile {
+        FedFile {
+            name: name.into(),
+            kind: kind.into(),
+            size: 10,
+            text: text.map(str::to_string),
+            truncated,
+            path: None,
+            modified: None,
+            created: None,
+        }
     }
 
     #[test]
-    fn reads_files_and_folders() {
-        let dir = std::env::temp_dir().join(format!("clawd-feed-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("sub")).unwrap();
-        fs::write(dir.join("notes.txt"), "line one\nline two").unwrap();
-        fs::write(dir.join("big.log"), "x".repeat(MAX_FILE_CHARS + 50)).unwrap();
-        fs::write(dir.join("pic.png"), [0x89, b'P', b'N', b'G', 0, 0, 0]).unwrap();
-
-        let notes = read(&dir.join("notes.txt")).unwrap();
-        assert_eq!((notes.kind.as_str(), notes.text.as_deref(), notes.truncated), ("text", Some("line one\nline two"), false));
-        let big = read(&dir.join("big.log")).unwrap();
-        assert!(big.truncated && big.text.unwrap().chars().count() == MAX_FILE_CHARS);
-        assert_eq!(read(&dir.join("pic.png")).unwrap().kind, "binary");
-        let folder = read(&dir).unwrap();
-        assert_eq!(folder.kind, "folder");
-        assert!(folder.text.unwrap().contains("sub/"));
-
-        let section = prompt_section(&[notes, read(&dir.join("pic.png")).unwrap()]);
-        assert!(section.contains("--- notes.txt ---\nline one"));
-        assert!(section.contains("not a text file"));
+    fn builds_the_prompt_section_within_budget() {
+        let section = prompt_section(&[
+            file("notes.txt", "text", Some("line one\nline two"), false),
+            file("pic.png", "binary", None, false),
+            file("src", "folder", Some("main.rs\nlib/"), false),
+            file("big.log", "text", Some("x"), true),
+        ]);
+        assert!(section.contains("--- notes.txt (10 bytes) ---\nline one\nline two\n"));
+        assert!(section.contains("pic.png (10 bytes; not a text file"));
+        assert!(section.contains("--- folder src (; its entries below) ---\nmain.rs"));
+        assert!(section.contains("x\n[…the rest is cut off]"));
         assert_eq!(prompt_section(&[]), "");
-        let _ = fs::remove_dir_all(dir);
+        let mut located = file("a.log", "text", Some("x"), false);
+        located.path = Some(r"C:\logs\a.log".into());
+        located.size = 2048;
+        located.modified = Some("25.10.2026 21:40".into());
+        assert!(prompt_section(&[located]).contains(r"--- a.log (path C:\logs\a.log, 2.0 KB, modified 25.10.2026 21:40) ---"));
+
+        let huge = "y".repeat(MAX_PROMPT_CHARS + 100);
+        let capped = prompt_section(&[file("a", "text", Some(&huge), false), file("b", "text", Some("zzz"), false)]);
+        assert!(capped.contains(&"y".repeat(MAX_PROMPT_CHARS)) && !capped.contains(&"y".repeat(MAX_PROMPT_CHARS + 1)));
+        assert!(!capped.contains("zzz"));
     }
 }

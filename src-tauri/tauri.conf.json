@@ -21,7 +21,8 @@
         "skipTaskbar": true,
         "resizable": false,
         "focus": false,
-        "visible": false
+        "visible": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {
@@ -53,7 +54,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NTE2RkIxQUE2OTlERTUKUldUbG5XbXFzVzlScVdkbzFqS0FzVCtJOTlpYTM1cEYzZ1F0TVlKSzdOZjY1YVNmeDVoalhGeFUK",
       "endpoints": [
-        "https://github.com/nersuga/claudepet/releases/latest/download/latest.json"
+        "https://github.com/fi-res/claudepet/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

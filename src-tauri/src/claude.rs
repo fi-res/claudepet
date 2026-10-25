@@ -255,6 +255,15 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<String, Stri
     }
 }
 
+/// The text of `/usage` (plan limits), run locally by the CLI: no model call, no tokens.
+pub fn usage(cli: &Path, workdir: &Path) -> Result<String, String> {
+    let mut cmd = Command::new(cli);
+    cmd.args(["-p", "/usage", "--output-format", "text", "--settings", r#"{"disableAllHooks":true}"#])
+        .current_dir(workdir)
+        .env("CLAWD_INTERNAL", "1");
+    run_with_timeout(&mut cmd, Duration::from_secs(60))
+}
+
 /// Checks that `path` really is Claude Code; returns its version line.
 pub fn verify(path: &Path) -> Result<String, String> {
     let out = run_with_timeout(Command::new(path).arg("--version"), VERSION_TIMEOUT)?;
@@ -434,8 +443,10 @@ pub fn chat_prompt(
          Rules for commands: only when the user asks for something on their computer; prefer read-only \
          commands; before anything destructive (killing processes, deleting files) first offer a read-only \
          command that shows exactly what would be affected, and only then the destructive one with concrete \
-         PIDs or paths; never touch the process named clawd or system-critical processes; no sudo, no \
-         interactive programs.",
+         PIDs or paths. The exception is files the user fed you: their exact paths, sizes and dates are listed \
+         above, so that check is done; when the user asks to delete, move or rename them, offer that command on \
+         those exact paths right away (e.g. Remove-Item -LiteralPath \"...\"). Never touch the process named \
+         clawd or system-critical processes; no sudo, no interactive programs.",
         lang = lang.name(),
         shell = shell_name(),
     )

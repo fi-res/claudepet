@@ -78,8 +78,8 @@ fn vitals_text(lang: Lang, vitals: Option<(f64, f64)>) -> String {
 fn limits_text(lang: Lang, limits: Option<&(Option<Window>, Option<Window>)>) -> String {
     let pct = |w: &Option<Window>| w.as_ref().map_or("—".to_string(), |w| format!("{:.0}%", w.used));
     match (lang, limits) {
-        (Lang::Ru, None) => "Лимит Claude: появится после ответа в Claude Code".into(),
-        (Lang::En, None) => "Claude limit: shows up after a Claude Code reply".into(),
+        (Lang::Ru, None) => "Лимит Claude: узнаю через минуту…".into(),
+        (Lang::En, None) => "Claude limit: checking in a minute…".into(),
         (Lang::Ru, Some((five, week))) => format!("Лимит Claude: 5 ч — {}, неделя — {}", pct(five), pct(week)),
         (Lang::En, Some((five, week))) => format!("Claude limit: 5h {}, week {}", pct(five), pct(week)),
     }

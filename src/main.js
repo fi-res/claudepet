@@ -3,6 +3,7 @@ import { GRID_W, GRID_H, drawIcon, drawPet, particleCanvas } from "./sprite.js";
 import { PHRASES, TOOL_PHRASES } from "./phrases.js";
 import { Brain } from "./brain.js";
 import { highlightCommand, renderAnsi } from "./terminal.js";
+import { limitWarning, pace } from "./limits.js";
 
 const UNIT = 5;
 const MAX_PARTICLES = 14;
@@ -129,6 +130,14 @@ const FED_FOR = 30 * 60;
 // The plan's usage from Claude Code's status line, and until when the limit bubble shows.
 let limits = null;
 let limitsUntil = 0;
+// Which limit warnings were already given, per reset window; kept across restarts.
+const LIMIT_MEMORY_KEY = "clawd.limitWarnings";
+let limitMemory = {};
+try {
+  limitMemory = JSON.parse(localStorage.getItem(LIMIT_MEMORY_KEY) || "{}") || {};
+} catch {
+  limitMemory = {};
+}
 
 const brain = new Brain(invoke);
 const pet = new Pet(UNIT, {
@@ -151,7 +160,9 @@ if (!tauri) window.clawdUi = { openChat, showConfirm, showOutput, sayText, say, 
   if (permissions.length === 1) showPermission();
 }, limits: (value) => {
   limits = value;
+  pet.limits = value;
   showLimits(30);
+  warnAboutLimits(value);
 }, feed: (file) => {
   pet.eatFile(nowSec());
   fedFiles = [...fedFiles, file].slice(-MAX_FED);
@@ -216,7 +227,12 @@ const TALK = new Set([
   "pomodoro_set",
   "reminders_cleared",
   "forgot",
+  "file_eaten",
+  "file_folder",
+  "file_binary",
+  "file_error",
   "limits_here",
+  "limits_checking",
   "limits_unknown",
 ]);
 let bubblePriority = 0;
@@ -480,12 +496,26 @@ function localIntent(message) {
   }
   // Usage limits are known only from Claude Code's status line; answer from that, no Haiku.
   if (LIMITS.test(message) && !/напомн|remind/i.test(message)) {
-    if (limits && (limits.five_hour || limits.seven_day)) {
+    const known = () => limits && (limits.five_hour || limits.seven_day);
+    const show = () => {
       showLimits(10);
       say("limits_here", true);
-    } else {
-      say("limits_unknown", true);
-    }
+    };
+    if (known()) show();
+    else say("limits_checking", true);
+    // Fresh numbers from `claude -p /usage` (local, no tokens); they also arrive as a limits event.
+    invoke("refresh_limits")
+      .then((event) => {
+        if (event) {
+          limits = event;
+          pet.limits = event;
+          if (limitsBox.classList.contains("open")) renderLimits();
+          else show();
+        } else if (!known()) {
+          say("limits_unknown", true);
+        }
+      })
+      .catch(() => known() || say("limits_unknown", true));
     return true;
   }
   if (FORGET.test(message)) {
@@ -709,9 +739,11 @@ function answerPermission(allow) {
 permissionAllow.addEventListener("click", () => answerPermission(true));
 permissionDeny.addEventListener("click", () => answerPermission(false));
 
-// The usage bar: one cell per 5%, each cell exactly one of Clawd's pixels.
+// The usage bar: one cell per 5%, each cell exactly one of Clawd's pixels. `fraction`
+// is how much of the window has passed: a dark tick there shows where "on pace" is,
+// so a fill running past it means the limit is going faster than time.
 const LIMIT_CELLS = 20;
-function drawLimitBar(canvas, used) {
+function drawLimitBar(canvas, used, fraction = null) {
   const s = cell || 5;
   const w = LIMIT_CELLS + 2;
   const h = 4;
@@ -731,6 +763,58 @@ function drawLimitBar(canvas, used) {
   ctx.fillRect(s, s, LIMIT_CELLS * s, (h - 2) * s);
   ctx.fillStyle = fill;
   ctx.fillRect(s, s, filled * s, (h - 2) * s);
+  if (fraction !== null) {
+    const tick = Math.min(LIMIT_CELLS, Math.max(1, Math.round(fraction * LIMIT_CELLS)));
+    ctx.fillStyle = "#3a2a22";
+    ctx.fillRect(tick * s, s, s, (h - 2) * s);
+  }
+}
+
+const locale = () => (lang === "ru" ? "ru-RU" : "en-US");
+const clock = (unix) => new Date(unix * 1000).toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" });
+const weekday = (unix) => new Date(unix * 1000).toLocaleDateString(locale(), { weekday: "short" });
+
+// "в 22:37" / "в пн 09:07" — a moment, with the weekday when it isn't today.
+function moment(unix) {
+  const sameDay = new Date(unix * 1000).toDateString() === new Date().toDateString();
+  if (lang === "ru") return sameDay ? `в ${clock(unix)}` : `в ${weekday(unix)} ${clock(unix)}`;
+  return sameDay ? `at ${clock(unix)}` : `on ${weekday(unix)} ${clock(unix)}`;
+}
+
+// "14 ч" / "2 дня" — how long the window has been running.
+function span(seconds) {
+  const hours = Math.round(seconds / 3600);
+  if (hours < 24) return lang === "ru" ? `${hours} ч` : `${hours} h`;
+  const days = Math.round(hours / 24);
+  if (lang !== "ru") return `${days} day${days === 1 ? "" : "s"}`;
+  const word = days % 10 === 1 && days % 100 !== 11 ? "день" : days % 10 >= 2 && days % 10 <= 4 && (days % 100 < 10 || days % 100 >= 20) ? "дня" : "дней";
+  return `${days} ${word}`;
+}
+
+// Says the most serious new limit warning, if there is one; urgent ones also go
+// out as a system notification.
+function warnAboutLimits(value) {
+  const warning = limitWarning(limitMemory, value, Date.now() / 1000);
+  try {
+    localStorage.setItem(LIMIT_MEMORY_KEY, JSON.stringify(limitMemory));
+  } catch {
+    // Without storage a warning may repeat after a restart; that's all.
+  }
+  if (!warning) return;
+  const vars = {
+    pct: Math.round(warning.used),
+    time: warning.resetAt ? moment(warning.resetAt) : value[warning.kind]?.resets || "",
+    when: warning.exhaustAt ? moment(warning.exhaustAt) : "",
+    days: warning.elapsed ? span(warning.elapsed) : "",
+  };
+  const text = phrase(warning.phrase).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+  const now = nowSec();
+  pet.setExpr("surprised", 1.2, now);
+  pet.waveUntil = now + 2;
+  pet.hop(440);
+  sayText(text, true, 12, "event");
+  showLimits(12);
+  if (warning.urgent) invoke("notify", { text }).catch(() => {});
 }
 
 function renderLimits() {
@@ -738,8 +822,8 @@ function renderLimits() {
   const time = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const day = (unix) => new Date(unix * 1000).toLocaleDateString([], { weekday: "short" });
   const rows = [
-    [ui.fiveHour, limits.five_hour, (w) => time(w.resets_at)],
-    [ui.week, limits.seven_day, (w) => `${day(w.resets_at)} ${time(w.resets_at)}`],
+    [ui.fiveHour, limits.five_hour, (w, at) => (at ? time(at) : w.resets)],
+    [ui.week, limits.seven_day, (w, at) => (at ? `${day(at)} ${time(at)}` : w.resets)],
   ].filter(([, w]) => w);
   limitsBox.replaceChildren(
     ...rows.map(([label, w, reset]) => {
@@ -749,12 +833,14 @@ function renderLimits() {
       name.className = "limit-label";
       name.textContent = label;
       const bar = document.createElement("canvas");
-      drawLimitBar(bar, w.used);
+      const kind = w === limits.five_hour ? "five_hour" : "seven_day";
+      drawLimitBar(bar, w.used, pace(kind, w, Date.now() / 1000)?.fraction ?? null);
       const pct = document.createElement("span");
       pct.textContent = `${Math.round(w.used)}%`;
       const when = document.createElement("span");
       when.className = "limit-reset";
-      when.textContent = w.resets_at ? `↻ ${reset(w)}` : "";
+      const at = pace(kind, w, Date.now() / 1000)?.resetAt ?? w.resets_at;
+      when.textContent = at || w.resets ? `↻ ${reset(w, at)}` : "";
       row.append(name, bar, pct, when);
       return row;
     }),
@@ -889,45 +975,124 @@ listen("memory_cleared", () => {
 
 // Dragging files onto Clawd feeds them to him. The overlay only takes the drop while
 // the cursor is over him or one of his boxes (elsewhere it lets the mouse through).
-const dropPoint = (position) => {
-  const scale = window.devicePixelRatio || 1;
-  return { x: position.x / scale, y: position.y / scale };
-};
 const overPet = ({ x, y }) => {
   const pad = pet.w * 0.4;
   return x >= pet.x - pad && x <= pet.x + pet.w + pad && y >= pet.y - pad && y <= pet.y + pet.h + pad;
 };
 let dragTeased = false;
-listen("tauri://drag-enter", () => {
-  dragTeased = false;
-});
-listen("tauri://drag-over", ({ payload }) => {
-  if (!payload?.position || !overPet(dropPoint(payload.position))) return;
-  pet.expectFood(nowSec());
-  if (!dragTeased) {
-    dragTeased = true;
-    say("file_drag", true);
+// Dropped files are read here (WebView2 hands the page the files themselves).
+const MAX_FILE_CHARS = 12000;
+const MAX_FOLDER_ENTRIES = 80;
+
+// Text from a file's first bytes (UTF-8, or UTF-16 with a BOM), or null if it's binary.
+function decodeText(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return new TextDecoder("utf-16le").decode(bytes.subarray(2));
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return new TextDecoder("utf-16be").decode(bytes.subarray(2));
+  if (bytes.includes(0)) return null;
+  // The read may stop in the middle of a multi-byte character: drop up to 3 bytes.
+  for (let cut = 0; cut < 4 && cut <= bytes.length; cut++) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytes.length - cut));
+    } catch {
+      // try a shorter tail
+    }
   }
+  return null;
+}
+
+async function readDropped({ entry, file }) {
+  const name = entry?.name || file?.name || "?";
+  if (entry?.isDirectory) {
+    const names = [];
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+      if (!batch.length || names.length > MAX_FOLDER_ENTRIES) break;
+      names.push(...batch.map((e) => e.name + (e.isDirectory ? "/" : "")));
+    }
+    names.sort();
+    const truncated = names.length > MAX_FOLDER_ENTRIES;
+    return { name, kind: "folder", size: 0, text: names.slice(0, MAX_FOLDER_ENTRIES).join("\n"), truncated };
+  }
+  if (!file) return { name, kind: "error", size: 0, text: null, truncated: false };
+  const buffer = await file.slice(0, MAX_FILE_CHARS * 4).arrayBuffer();
+  const text = decodeText(buffer);
+  if (text === null) return { name, kind: "binary", size: file.size, text: null, truncated: false };
+  const chars = [...text];
+  const clipped = chars.length > MAX_FILE_CHARS;
+  return {
+    name,
+    kind: "text",
+    size: file.size,
+    text: clipped ? chars.slice(0, MAX_FILE_CHARS).join("") : text,
+    truncated: clipped || file.size > buffer.byteLength,
+  };
+}
+
+// Paths and dates of dropped files, which Rust gets from WebView2 (Windows only).
+const dropMeta = new Map();
+const fileTime = (unix) => (unix ? new Date(unix * 1000).toLocaleString(locale()) : null);
+function withMeta(f) {
+  const m = dropMeta.get(f.name);
+  return m ? { ...f, path: m.path, modified: fileTime(m.modified), created: fileTime(m.created) } : f;
+}
+listen("file_meta", ({ payload }) => {
+  for (const m of payload || []) dropMeta.set(m.name, m);
+  fedFiles = fedFiles.map(withMeta);
 });
-listen("tauri://drag-leave", () => {
-  dragTeased = false;
-});
-listen("tauri://drag-drop", ({ payload }) => {
-  const paths = (payload?.paths || []).slice(0, MAX_FED);
-  if (!paths.length) return;
+
+// Eats dropped files and keeps them for the chat.
+function feedFiles(sources) {
+  sources = sources.slice(0, MAX_FED);
+  if (!sources.length) return;
   pet.eatFile(nowSec());
-  const failed = (path) => ({ name: path.split(/[\\/]/).pop(), kind: "error" });
-  Promise.all(paths.map((path) => invoke("feed_file", { path }).then((f) => f || failed(path), () => failed(path))))
-    .then((files) => {
-      const good = files.filter((f) => f && f.kind !== "error");
-      fedFiles = [...fedFiles.filter((f) => !good.some((g) => g.path === f.path)), ...good].slice(-MAX_FED);
-      fedAt = nowSec();
-      const last = files[files.length - 1];
-      const name = files.length > 1 ? files.map((f) => f.name).join(", ") : last.name;
-      const phrase = { error: "file_error", binary: "file_binary", folder: "file_folder" }[last.kind] || "file_eaten";
-      say(phrase, true, { name });
-      if (good.length) openChat();
-    });
+  const failed = (source) => ({ name: source.file?.name || "?", kind: "error", size: 0, text: null, truncated: false });
+  Promise.all(sources.map((source) => readDropped(source).catch(() => failed(source)))).then((files) => {
+    const good = files.filter((f) => f.kind !== "error").map(withMeta);
+    fedFiles = [...fedFiles.filter((f) => !good.some((g) => g.name === f.name)), ...good].slice(-MAX_FED);
+    fedAt = nowSec();
+    const last = files[files.length - 1];
+    const name = files.length > 1 ? files.map((f) => f.name).join(", ") : last.name;
+    const phrase = { error: "file_error", binary: "file_binary", folder: "file_folder" }[last.kind] || "file_eaten";
+    // The chat opens first so its greeting doesn't cover what Clawd says about the file.
+    if (good.length) openChat();
+    say(phrase, true, { name });
+  });
+}
+
+const draggingFiles = (e) => [...(e.dataTransfer?.types || [])].includes("Files");
+for (const type of ["dragenter", "dragover"]) {
+  window.addEventListener(type, (e) => {
+    if (!draggingFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    if (!overPet({ x: e.clientX, y: e.clientY })) return;
+    pet.expectFood(nowSec());
+    if (!dragTeased) {
+      dragTeased = true;
+      say("file_drag", true);
+    }
+  });
+}
+window.addEventListener("dragleave", (e) => {
+  if (!e.relatedTarget) dragTeased = false;
+});
+window.addEventListener("drop", (e) => {
+  if (!draggingFiles(e)) return;
+  e.preventDefault();
+  dragTeased = false;
+  // Entries have to be taken right away: the drop data is gone after this handler.
+  const sources = [...e.dataTransfer.items]
+    .filter((item) => item.kind === "file")
+    .map((item) => ({ entry: item.webkitGetAsEntry?.(), file: item.getAsFile() }));
+  // WebView2 can hand the files themselves to Rust, which finds their paths and dates.
+  try {
+    window.chrome?.webview?.postMessageWithAdditionalObjects?.("clawd:files", e.dataTransfer.files);
+  } catch {
+    // Older WebView2 runtimes: Clawd still reads the files, just without their paths.
+  }
+  feedFiles(sources);
 });
 listen("chat_open", () => openChat());
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
@@ -945,7 +1110,7 @@ listen("claude", ({ payload }) => {
       limits = payload;
       pet.limits = payload;
       if (limitsBox.classList.contains("open")) renderLimits();
-      if (pet.onLimits(payload, now)) showLimits(8);
+      warnAboutLimits(payload);
       return;
     }
     case "stop":

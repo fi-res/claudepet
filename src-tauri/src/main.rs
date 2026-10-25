@@ -3,6 +3,7 @@
 mod audio;
 mod claude;
 mod context;
+mod droppaths;
 mod files;
 mod hooks;
 mod reminders;
@@ -36,6 +37,8 @@ pub const WINDOW: &str = "pet";
 const CURSOR_POLL: Duration = Duration::from_millis(16);
 const REFIT_EVERY: u32 = 120;
 const MAX_FACTS: usize = 8;
+/// How often Clawd asks `claude -p /usage` for the plan limits on his own.
+const USAGE_EVERY: Duration = Duration::from_secs(10 * 60);
 const MAX_RECENT: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
@@ -242,12 +245,28 @@ fn save_recent(state: State<'_, Arc<AppState>>, recent: Vec<[String; 2]>) {
     state.update(|s| s.memory.recent = recent.into_iter().skip(skip).collect());
 }
 
-/// A file or folder dropped on Clawd: read (capped) for the chat to talk about.
+/// Asks Claude Code for the plan limits (`/usage`) and passes them on as a limits event.
+fn fetch_usage(state: &AppState) -> Option<ClaudeEvent> {
+    let cli = state.haiku.cli()?;
+    let text = claude::usage(&cli, &state.haiku.workdir).map_err(|e| eprintln!("usage: {e}")).ok()?;
+    let event = hooks::parse_usage(&text)?;
+    if let Some(hub) = state.hub.get() {
+        hub.limits(event.clone());
+    }
+    Some(event)
+}
+
+/// The chat asked about limits: fetch fresh numbers now.
 #[tauri::command]
-async fn feed_file(path: String) -> Result<files::FedFile, String> {
-    tauri::async_runtime::spawn_blocking(move || files::read(std::path::Path::new(&path)))
-        .await
-        .map_err(|e| e.to_string())?
+async fn refresh_limits(state: State<'_, Arc<AppState>>) -> Result<Option<ClaudeEvent>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || fetch_usage(&state)).await.map_err(|e| e.to_string())
+}
+
+/// A system notification (for warnings that shouldn't be missed behind other windows).
+#[tauri::command]
+fn notify(app: tauri::AppHandle, text: String) {
+    let _ = app.notification().builder().title("Clawd").body(text).show();
 }
 
 /// The user clicked Allow or Deny on a Claude Code permission card.
@@ -297,7 +316,8 @@ fn main() {
             save_recent,
             forget_memory,
             answer_permission,
-            feed_file
+            refresh_limits,
+            notify
         ])
         .setup(|app| {
             let window = app
@@ -381,6 +401,13 @@ fn main() {
                 }
             }
 
+            // Paths and metadata of files dropped on Clawd (the page only sees names and contents).
+            let w = window.clone();
+            droppaths::listen(&window, move |paths| {
+                let metas: Vec<droppaths::FileMeta> = paths.iter().filter_map(|p| droppaths::meta(p)).collect();
+                send(&w, "file_meta", metas);
+            });
+
             let (w, s) = (window.clone(), state.clone());
             let app_handle = app.handle().clone();
             reminders::spawn(state.clone(), move |r| {
@@ -395,6 +422,14 @@ fn main() {
                     .body(if r.text.is_empty() { "⏰" } else { r.text.as_str() })
                     .show();
                 tray::refresh(&s);
+            });
+
+            // The Claude app doesn't run Claude Code's status line, so ask `/usage` now and then.
+            let s = state.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(20));
+                fetch_usage(&s);
+                thread::sleep(USAGE_EVERY);
             });
 
             tray::build(app, state.clone())?;

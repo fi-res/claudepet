@@ -91,12 +91,34 @@ fn permission_reply(allow: bool) -> Value {
 pub struct Window {
     pub used: f64,
     pub resets_at: Option<u64>,
+    /// When it resets as `/usage` words it ("Oct 26, 12:20am"), if there's no timestamp.
+    pub resets: Option<String>,
 }
 
 fn limit_window(v: &Value) -> Option<Window> {
     let used = v.get("used_percentage")?.as_f64()?;
     let resets_at = v.get("resets_at").and_then(|r| r.as_u64().or_else(|| r.as_f64().map(|f| f as u64)));
-    Some(Window { used, resets_at })
+    Some(Window { used, resets_at, resets: None })
+}
+
+/// One "Current …: 67% used · resets Oct 26, 12:20am (Europe/Moscow)" line of `/usage`.
+fn usage_line(text: &str, label: &str) -> Option<Window> {
+    let line = text.lines().map(str::trim).find(|l| l.starts_with(label))?;
+    let rest = line[label.len()..].trim_start_matches(':').trim();
+    let used: f64 = rest.split('%').next()?.trim().parse().ok()?;
+    let resets = rest
+        .split_once("resets")
+        .map(|(_, r)| r.trim())
+        .map(|r| r.split(" (").next().unwrap_or(r).trim().to_string())
+        .filter(|r| !r.is_empty());
+    Some(Window { used, resets_at: None, resets })
+}
+
+/// Reads the plan limits out of `claude -p /usage` output.
+pub fn parse_usage(text: &str) -> Option<ClaudeEvent> {
+    let five_hour = usage_line(text, "Current session");
+    let seven_day = usage_line(text, "Current week (all models)").or_else(|| usage_line(text, "Current week"));
+    (five_hour.is_some() || seven_day.is_some()).then_some(ClaudeEvent::Limits { five_hour, seven_day })
 }
 
 /// Reads `rate_limits` from Claude Code's status line input.
@@ -318,6 +340,11 @@ impl Hub {
                 None
             }
         }
+    }
+
+    /// Plan limits read some other way (`claude -p /usage`), passed on like the status line's.
+    pub fn limits(&self, event: ClaudeEvent) {
+        (self.emit)(event);
     }
 
     /// Status line updates carry the plan's usage limits.
@@ -757,11 +784,27 @@ mod tests {
         assert_eq!(
             parse_limits(&status),
             Some(ClaudeEvent::Limits {
-                five_hour: Some(Window { used: 23.5, resets_at: Some(1767225600) }),
-                seven_day: Some(Window { used: 41.0, resets_at: None }),
+                five_hour: Some(Window { used: 23.5, resets_at: Some(1767225600), resets: None }),
+                seven_day: Some(Window { used: 41.0, resets_at: None, resets: None }),
             })
         );
         assert_eq!(parse_limits(&json!({ "model": {} })), None);
+    }
+
+    #[test]
+    fn reads_limits_from_usage_output() {
+        let text = "You are currently using your subscription to power your Claude Code usage\n\n\
+                    Current session: 67% used · resets Oct 26, 12:20am (Europe/Moscow)\n\
+                    Current week (all models): 80.5% used · resets Oct 30, 11pm (Europe/Moscow)\n\
+                    Current week (Sonnet only): 12% used\n";
+        assert_eq!(
+            parse_usage(text),
+            Some(ClaudeEvent::Limits {
+                five_hour: Some(Window { used: 67.0, resets_at: None, resets: Some("Oct 26, 12:20am".into()) }),
+                seven_day: Some(Window { used: 80.5, resets_at: None, resets: Some("Oct 30, 11pm".into()) }),
+            })
+        );
+        assert_eq!(parse_usage("Not logged in"), None);
     }
 
     #[test]

@@ -518,6 +518,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "wasapi",
+ "webview2-com",
  "windows",
  "x11rb",
 ]

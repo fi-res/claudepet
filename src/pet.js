@@ -155,7 +155,6 @@ export class Pet {
     this.workSince = 0;
     this.lastBreakNag = -Infinity;
     this.reminder = null;
-    this.limitWarned = new Map();
     // The cursor is over a box above Clawd (chat, reminder card).
     this.uiHover = false;
     // Claude plan usage from the status line, when Claude Code has sent it.
@@ -347,20 +346,6 @@ export class Pet {
     this.lastBreakNag = now;
     this.stretchUntil = now + 2.5;
     this.fx.say("break", true, { minutes: Math.round((now - this.workSince) / 60) });
-  }
-
-  onLimits(event, now) {
-    const five = event.five_hour;
-    if (!five) return false;
-    const reset = five.resets_at ? new Date(five.resets_at * 1000) : null;
-    const key = reset ? reset.getTime() : 0;
-    const level = five.used >= 95 ? 95 : five.used >= 80 ? 80 : 0;
-    if (!level || (this.limitWarned.get(key) || 0) >= level) return false;
-    this.limitWarned.set(key, level);
-    const time = reset ? reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-    this.setExpr("surprised", 1, now);
-    this.fx.say(level >= 95 ? "limit_high" : "limit_warn", true, { pct: Math.round(five.used), time });
-    return true;
   }
 
   get held() {
@@ -1035,9 +1020,6 @@ export class Pet {
         this.fx.say(phrase, true, { error, project: event.project });
         break;
       }
-      case "limits":
-        this.onLimits(event, now);
-        break;
     }
   }
 
