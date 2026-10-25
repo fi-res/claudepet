@@ -13,6 +13,8 @@ const listen = tauri ? tauri.event.listen : () => Promise.resolve();
 
 const canvas = document.getElementById("pet");
 const bubble = document.getElementById("bubble");
+const chatForm = document.getElementById("chat");
+const chatInput = document.getElementById("chat-input");
 const ctx = canvas.getContext("2d");
 
 const nowSec = () => performance.now() / 1000;
@@ -26,6 +28,10 @@ let lastPhrase = null;
 let bubbleUntil = 0;
 let bubbleImportant = false;
 let lang = navigator.language?.toLowerCase().startsWith("ru") ? "ru" : "en";
+let chatOpen = false;
+let chatHistory = [];
+
+const PLACEHOLDER = { ru: "Напиши Clawd… (Esc — закрыть)", en: "Message Clawd… (Esc to close)" };
 
 const brain = new Brain(invoke);
 const pet = new Pet(UNIT, {
@@ -143,9 +149,16 @@ function render(now) {
     const bh = bubble.offsetHeight;
     const margin = 4;
     const bx = Math.min(Math.max(pet.x + pet.w / 2 - bw / 2, margin), window.innerWidth - bw - margin);
-    let by = y + pet.unit - bh - margin;
+    const lift = chatOpen ? chatForm.offsetHeight + margin : 0;
+    let by = y + pet.unit - bh - margin - lift;
     if (by < 0) by = y + pet.h + margin;
     bubble.style.transform = `translate(${bx}px, ${by}px)`;
+  }
+  if (chatOpen) {
+    const cw = chatForm.offsetWidth;
+    const cx = Math.min(Math.max(pet.x + pet.w / 2 - cw / 2, 4), window.innerWidth - cw - 4);
+    const cy = Math.max(y + pet.unit - chatForm.offsetHeight - 4, 4);
+    chatForm.style.transform = `translate(${cx}px, ${cy}px)`;
   }
 }
 
@@ -154,7 +167,7 @@ function render(now) {
 let passthrough = null;
 function updatePassthrough() {
   const c = pet.cursor;
-  const over = !!c && pet.hitTest(c.x, c.y);
+  const over = !!c && (pet.hitTest(c.x, c.y) || overChat(c.x, c.y));
   const want = !(over || pet.held);
   document.body.classList.toggle("over", over && !pet.held);
   document.body.classList.toggle("held", pet.held);
@@ -162,6 +175,69 @@ function updatePassthrough() {
   passthrough = want;
   invoke("set_click_through", { enabled: want }).catch((e) => console.error(e));
 }
+
+function overChat(x, y) {
+  if (!chatOpen) return false;
+  const r = chatForm.getBoundingClientRect();
+  return x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 4 && y <= r.bottom + 4;
+}
+
+function openChat() {
+  if (!chatOpen) {
+    chatOpen = true;
+    chatInput.placeholder = PLACEHOLDER[lang];
+    chatInput.value = "";
+    chatInput.disabled = false;
+    chatForm.classList.add("open");
+    pet.startChat(nowSec());
+  }
+  // The overlay starts unfocused; the box needs keyboard focus to type into.
+  invoke("focus_window")
+    .catch(() => {})
+    .finally(() => chatInput.focus());
+}
+
+function closeChat() {
+  if (!chatOpen) return;
+  chatOpen = false;
+  chatForm.classList.remove("open");
+  chatInput.blur();
+  pet.endChat();
+}
+
+chatForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  const message = chatInput.value.trim();
+  if (!message) return closeChat();
+  if (chatInput.disabled) return;
+  chatInput.value = "";
+  chatInput.disabled = true;
+  pet.awaitingReply = true;
+  sayText("…", true);
+  const context = brain.describe(pet, nowSec());
+  invoke("claude_chat", { context, history: chatHistory, message })
+    .then((reply) => {
+      if (!reply) throw new Error("empty reply");
+      chatHistory.push(["user", message], ["clawd", reply]);
+      chatHistory = chatHistory.slice(-16);
+      sayText(reply, true);
+      pet.hop(260);
+    })
+    .catch(() => say("chat_error", true))
+    .finally(() => {
+      pet.awaitingReply = false;
+      chatInput.disabled = false;
+      if (chatOpen) chatInput.focus();
+    });
+});
+
+chatInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeChat();
+});
+// Clicking into another app takes focus away: put the box away too.
+window.addEventListener("blur", () => {
+  if (!chatInput.disabled) closeChat();
+});
 
 window.addEventListener("pointerdown", (e) => {
   if (e.button !== 0 || !pet.hitTest(e.clientX, e.clientY)) return;
@@ -179,7 +255,11 @@ window.addEventListener("pointermove", (e) => {
 
 window.addEventListener("pointerup", () => pet.pointerUp(nowSec()));
 window.addEventListener("pointercancel", () => pet.pointerUp(nowSec(), true));
-window.addEventListener("contextmenu", (e) => e.preventDefault());
+// Right-click on Clawd opens the chat box.
+window.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  if (pet.hitTest(e.clientX, e.clientY)) openChat();
+});
 
 // While click-through is on the webview gets no mouse events, so Rust polls the cursor for us.
 listen("cursor", ({ payload }) => {
@@ -188,6 +268,7 @@ listen("cursor", ({ payload }) => {
   updatePassthrough();
 });
 listen("recall", () => pet.recall(nowSec()));
+listen("chat_open", () => openChat());
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
 listen("claude", ({ payload }) => pet.onClaude(payload, nowSec()));
 listen("notice", ({ payload }) => {

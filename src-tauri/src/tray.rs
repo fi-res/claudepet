@@ -29,6 +29,7 @@ fn text(lang: Lang, key: &str) -> &'static str {
     let ru = lang == Lang::Ru;
     match key {
         "recall" => if ru { "Позвать Clawd" } else { "Call Clawd" },
+        "chat" => if ru { "Поговорить с Clawd…" } else { "Talk to Clawd…" },
         "hide" => if ru { "Спрятать" } else { "Hide" },
         "show" => if ru { "Показать" } else { "Show" },
         "listen" => if ru { "Слушать звук" } else { "Listen to sound" },
@@ -45,6 +46,7 @@ fn text(lang: Lang, key: &str) -> &'static str {
 #[derive(Clone)]
 struct Items {
     recall: MenuItem<Wry>,
+    chat: MenuItem<Wry>,
     toggle: MenuItem<Wry>,
     listen: CheckMenuItem<Wry>,
     watch: CheckMenuItem<Wry>,
@@ -59,6 +61,7 @@ struct Items {
 impl Items {
     fn relabel(&self, lang: Lang, visible: bool) {
         let _ = self.recall.set_text(text(lang, "recall"));
+        let _ = self.chat.set_text(text(lang, "chat"));
         let _ = self.toggle.set_text(text(lang, if visible { "hide" } else { "show" }));
         let _ = self.listen.set_text(text(lang, "listen"));
         let _ = self.watch.set_text(text(lang, "watch"));
@@ -82,6 +85,7 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
     let check = |id: &str, on: bool| CheckMenuItem::with_id(app, id, text(lang, id), true, on, None::<&str>);
     let items = Items {
         recall: MenuItem::with_id(app, "recall", text(lang, "recall"), true, None::<&str>)?,
+        chat: MenuItem::with_id(app, "chat", text(lang, "chat"), true, None::<&str>)?,
         toggle: MenuItem::with_id(app, "toggle", text(lang, "hide"), true, None::<&str>)?,
         listen: check("listen", settings.listen)?,
         watch: check("watch", settings.watch)?,
@@ -97,6 +101,7 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
         app,
         &[
             &items.recall,
+            &items.chat,
             &items.toggle,
             &PredefinedMenuItem::separator(app)?,
             &items.listen,
@@ -120,6 +125,10 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
             "recall" => {
                 set_visible(app, &items, lang, true);
                 let _ = app.emit_to(WINDOW, "recall", ());
+            }
+            "chat" => {
+                set_visible(app, &items, lang, true);
+                let _ = app.emit_to(WINDOW, "chat_open", ());
             }
             "toggle" => set_visible(app, &items, lang, !window_visible(app)),
             "listen" => {

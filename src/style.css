@@ -61,3 +61,36 @@ body.held {
   opacity: 1;
   visibility: visible;
 }
+
+#chat {
+  position: absolute;
+  left: 0;
+  top: 0;
+  margin: 0;
+  display: none;
+  will-change: transform;
+}
+
+#chat.open {
+  display: block;
+}
+
+#chat-input {
+  width: 220px;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: #ffffff;
+  color: #1a1a1a;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  font: 500 13px/1.3 system-ui, "Segoe UI", "Noto Sans", sans-serif;
+  outline: none;
+}
+
+#chat-input:focus {
+  border-color: #d77757;
+}
+
+#chat-input:disabled {
+  opacity: 0.6;
+}

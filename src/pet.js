@@ -72,6 +72,8 @@ export class Pet {
     this.typingPause = 0;
     this.napUntil = 0;
     this.lastUserInput = now;
+    this.chatting = false;
+    this.awaitingReply = false;
     this.nextChatter = now + rand(CHATTER_EVERY[0], CHATTER_EVERY[1]);
     this.music = false;
     this.musicReacted = false;
@@ -138,6 +140,24 @@ export class Pet {
   noteUserInput(now) {
     if (this.state === "sleep" && now - this.lastUserInput > AWAY_AFTER) this.wakeUp(now, "welcome_back");
     this.lastUserInput = now;
+  }
+
+  startChat(now) {
+    this.chatting = true;
+    this.lastInteraction = now;
+    if (this.state === "sleep") {
+      this.wakeUp(now, "chat_hello");
+      return;
+    }
+    // Put the book or laptop away to talk, unless he's busy helping Claude.
+    if (ACTIVITY_STATES.has(this.state) && !this.claudeWork) this.state = "idle";
+    this.look = 0;
+    this.fx.say("chat_hello", true);
+  }
+
+  endChat() {
+    this.chatting = false;
+    this.awaitingReply = false;
   }
 
   wakeUp(now, phrase) {
@@ -304,6 +324,13 @@ export class Pet {
 
     const attention = this.attention(now);
     if (attention !== null) this.look = attention;
+
+    if (this.chatting) {
+      this.lastInteraction = now;
+      this.nextChatter = now + 10;
+      this.nextAction = Math.max(this.nextAction, now + 1);
+      return;
+    }
 
     if (now >= this.nextChatter && now - this.lastInteraction > 5 && !this.hopActive && !this.walkIn) {
       this.nextChatter = now + rand(CHATTER_EVERY[0], CHATTER_EVERY[1]);
@@ -832,6 +859,10 @@ export class Pet {
       if (this.expr === "happy") blush = true;
     }
     if (now < this.squashUntil && squash === 0) squash = 1;
+    if (this.awaitingReply) {
+      eyes = "up";
+      spinner = Math.floor(now * 8) % SPINNER_LENGTH;
+    }
     const canBlink = ["idle", "walk", "hang", "code", "think"].includes(state);
     if (now < this.blinkUntil && (eyes === "open" || eyes === "up") && canBlink) eyes = "blink";
     if (legs === "tuck" && squash) squash = 0;

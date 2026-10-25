@@ -81,13 +81,42 @@ async fn claude_phrases(state: State<'_, Arc<AppState>>, context: String, count:
     .map_err(|e| e.to_string())?
 }
 
+/// Clawd's answer to something the user typed into the chat box.
+#[tauri::command]
+async fn claude_chat(
+    state: State<'_, Arc<AppState>>,
+    context: String,
+    history: Vec<[String; 2]>,
+    message: String,
+) -> Result<String, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = state.haiku.run(|lang| claude::chat_prompt(lang, &context, &history, &message))?;
+        claude::reply(&out, 220).ok_or_else(|| "empty reply".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The overlay is created unfocused; typing into the chat box needs keyboard focus.
+#[tauri::command]
+fn focus_window(window: WebviewWindow) -> Result<(), String> {
+    window.set_focus().map_err(|e| e.to_string())
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     prepare_linux_env();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![set_click_through, get_language, claude_phrases])
+        .invoke_handler(tauri::generate_handler![
+            set_click_through,
+            get_language,
+            claude_phrases,
+            claude_chat,
+            focus_window
+        ])
         .setup(|app| {
             let window = app
                 .get_webview_window(WINDOW)

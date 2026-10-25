@@ -371,6 +371,36 @@ pub fn done_prompt(lang: Lang, project: &str, last_message: &str) -> String {
     )
 }
 
+/// The prompt for a reply to something the user typed to Clawd in the chat box.
+/// `history` holds earlier turns as (speaker, text), speaker being "user" or "clawd".
+pub fn chat_prompt(lang: Lang, context: &str, history: &[[String; 2]], message: &str) -> String {
+    let mut dialogue = String::new();
+    for [who, text] in history.iter().rev().take(8).rev() {
+        let who = if who == "user" { "User" } else { "Clawd" };
+        dialogue.push_str(&format!("{who}: {text}\n"));
+    }
+    format!(
+        "What is going on right now:\n{context}\n\nConversation so far:\n{dialogue}User: {message}\n\n\
+         Answer the user as Clawd, in {}, in one or two short sentences (under 200 characters), staying \
+         in character. If they ask something you can't know, say so playfully.",
+        lang.name()
+    )
+}
+
+/// One clean reply for the speech bubble: no quotes or speaker prefix, whitespace collapsed.
+pub fn reply(output: &str, max_chars: usize) -> Option<String> {
+    let text = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = text.strip_prefix("Clawd:").unwrap_or(&text).trim();
+    let text = text.trim_matches(|c: char| matches!(c, '"' | '«' | '»' | '“' | '”' | '`')).trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(match text.char_indices().nth(max_chars) {
+        Some((i, _)) => format!("{}…", text[..i].trim_end()),
+        None => text.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +411,19 @@ mod tests {
             + &"x".repeat(80);
         assert_eq!(phrases(&out, 40), vec!["Привет!", "Ещё строка", "Третья"]);
         assert_eq!(phrases("3 бага починил\n2) Готово", 40), vec!["3 бага починил", "Готово"]);
+    }
+
+    #[test]
+    fn chat_reply_is_one_clean_line() {
+        assert_eq!(reply("Clawd: «Привет!\n  Как дела?»", 200).as_deref(), Some("Привет! Как дела?"));
+        assert_eq!(reply("   ", 200), None);
+        assert_eq!(reply(&"a".repeat(10), 4).as_deref(), Some("aaaa…"));
+    }
+
+    #[test]
+    fn chat_prompt_keeps_recent_turns() {
+        let history: Vec<[String; 2]> = (0..12).map(|i| ["user".into(), format!("m{i}")]).collect();
+        let prompt = chat_prompt(Lang::En, "- ctx", &history, "hi");
+        assert!(!prompt.contains("User: m3\n") && prompt.contains("User: m4\n") && prompt.contains("User: hi"));
     }
 }
