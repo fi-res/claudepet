@@ -4,6 +4,11 @@ import { GRID_W, GRID_H, SPINNER_LENGTH } from "./sprite.js";
 const GRAVITY = 2600;
 const WALK_SPEED = 42;
 const SLEEP_AFTER = 180;
+// Dozing off on his own lasts this long (minutes) at most.
+const DEEP_SLEEP = [20, 40];
+// Coming back to the computer after this long wakes him up.
+const AWAY_AFTER = 300;
+const HOVER_WAKE = 1.5;
 const ATTENTION_RADIUS = 360;
 const ATTENTION_TIME = 2.5;
 
@@ -64,6 +69,7 @@ export class Pet {
     this.flipUntil = 0;
     this.typingPause = 0;
     this.napUntil = 0;
+    this.lastUserInput = now;
     this.music = false;
     this.musicReacted = false;
     this.phones = false;
@@ -122,6 +128,23 @@ export class Pet {
     const c = this.cursor;
     if (c && Math.abs(c.x - x) < 0.5 && Math.abs(c.y - y) < 0.5) return;
     this.cursor = { x, y, t: now };
+    this.noteUserInput(now);
+  }
+
+  // The user moved the mouse or typed; after a long absence that wakes Clawd up.
+  noteUserInput(now) {
+    if (this.state === "sleep" && now - this.lastUserInput > AWAY_AFTER) this.wakeUp(now, "welcome_back");
+    this.lastUserInput = now;
+  }
+
+  wakeUp(now, phrase) {
+    this.napUntil = 0;
+    this.state = "idle";
+    this.lastInteraction = now;
+    this.nextAction = now + rand(2, 4);
+    this.hoverSince = 0;
+    this.hop(300);
+    this.fx.say(phrase, true);
   }
 
   step(now) {
@@ -234,12 +257,22 @@ export class Pet {
 
     if (this.state === "sleep") {
       if (this.napUntil && now >= this.napUntil) {
-        this.napUntil = 0;
-        this.state = "idle";
-        this.nextAction = now + rand(2, 4);
-        this.hop(300);
-        this.fx.say("stretch");
+        this.wakeUp(now, "stretch");
         return;
+      }
+      if (this.music) {
+        this.wakeUp(now, "music_wake");
+        return;
+      }
+      const c = this.cursor;
+      if (c && this.hitTest(c.x, c.y)) {
+        if (!this.hoverSince) this.hoverSince = now;
+        if (now - this.hoverSince > HOVER_WAKE) {
+          this.wakeUp(now, "wake");
+          return;
+        }
+      } else {
+        this.hoverSince = 0;
       }
       if (now >= this.nextZ) {
         this.nextZ = now + 1.6;
@@ -271,7 +304,7 @@ export class Pet {
 
     const busy = this.music || this.claudeSessions.size > 0;
     if (now - this.lastInteraction > SLEEP_AFTER && !busy && !this.hopActive && !this.walkIn) {
-      this.goToSleep(now, 0);
+      this.goToSleep(now, now + rand(DEEP_SLEEP[0], DEEP_SLEEP[1]) * 60);
       this.fx.hideBubble();
       return;
     }
@@ -318,7 +351,6 @@ export class Pet {
     this.fx.say(`${state}_start`);
   }
 
-  // napUntil = 0 means sleep until someone wakes him up.
   goToSleep(now, napUntil) {
     this.state = "sleep";
     this.phones = false;
@@ -477,6 +509,7 @@ export class Pet {
 
   onTyping(kpm, now) {
     if (kpm === null) return;
+    if (kpm > 0) this.noteUserInput(now);
     if (kpm < FAST_TYPING_KPM) {
       this.fastTypingSince = 0;
       return;
