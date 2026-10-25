@@ -194,9 +194,6 @@ listen("notice", ({ payload }) => {
   if (payload.phrase === "claude_found") brain.forget();
   say(payload.phrase, true);
 });
-invoke("get_language").then((value) => {
-  if (value) lang = value;
-});
 listen("language", ({ payload }) => {
   lang = payload;
   brain.forget();
@@ -228,5 +225,10 @@ function tick(ms) {
   requestAnimationFrame(tick);
 }
 
-fitCanvas();
-requestAnimationFrame(tick);
+// Clawd greets on his first frame, so learn the saved language before starting.
+const timeout = new Promise((resolve) => setTimeout(resolve, 500));
+Promise.race([invoke("get_language").catch(() => null), timeout]).then((value) => {
+  if (value) lang = value;
+  fitCanvas();
+  requestAnimationFrame(tick);
+});
