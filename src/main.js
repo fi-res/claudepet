@@ -1,6 +1,6 @@
 import { Pet } from "./pet.js";
 import { GRID_W, GRID_H, drawPet, particleCanvas } from "./sprite.js";
-import { PHRASES } from "./phrases.js";
+import { PHRASES, TOOL_PHRASES } from "./phrases.js";
 import { Brain } from "./brain.js";
 
 const UNIT = 5;
@@ -25,6 +25,7 @@ let particles = 0;
 let lastPhrase = null;
 let bubbleUntil = 0;
 let bubbleImportant = false;
+let lang = navigator.language?.toLowerCase().startsWith("ru") ? "ru" : "en";
 
 const brain = new Brain(invoke);
 const pet = new Pet(UNIT, {
@@ -47,13 +48,21 @@ function fitCanvas() {
   frameKey = null;
 }
 
+function linesFor(category, vars) {
+  if (category.startsWith("tool:")) {
+    const tools = TOOL_PHRASES[lang];
+    return (vars.detail && tools[category.slice(5)]) || tools.default;
+  }
+  return PHRASES[lang][category] || [category];
+}
+
 // `vars` fill {placeholders}; lines that need a missing one are skipped.
 function say(category, force = false, vars = {}) {
   if (category === "idle" && Math.random() < 0.75) {
     const generated = brain.take();
     if (generated) return sayText(generated, force);
   }
-  const all = Array.isArray(category) ? category : PHRASES[category] || [category];
+  const all = linesFor(category, vars);
   const usable = all.filter((p) => [...p.matchAll(/\{(\w+)\}/g)].every(([, k]) => vars[k]));
   const phrases = usable.length ? usable : all;
   const options = phrases.filter((p) => p !== lastPhrase);
@@ -181,7 +190,18 @@ listen("cursor", ({ payload }) => {
 listen("recall", () => pet.recall(nowSec()));
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
 listen("claude", ({ payload }) => pet.onClaude(payload, nowSec()));
-listen("notice", ({ payload }) => say(payload.phrase, true));
+listen("notice", ({ payload }) => {
+  if (payload.phrase === "claude_found") brain.forget();
+  say(payload.phrase, true);
+});
+invoke("get_language").then((value) => {
+  if (value) lang = value;
+});
+listen("language", ({ payload }) => {
+  lang = payload;
+  brain.forget();
+  say("language", true);
+});
 listen("context", ({ payload }) => {
   const now = nowSec();
   pet.onTyping(payload.kind === "typing" ? payload.kpm : null, now);

@@ -4,26 +4,27 @@ mod audio;
 mod claude;
 mod context;
 mod hooks;
+mod settings;
+mod tray;
 
 use std::{
     fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, RwLock,
     },
     thread,
     time::Duration,
 };
 
 use serde::Serialize;
-use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
-    tray::TrayIconBuilder,
-    App, AppHandle, Emitter, Manager, State, WebviewWindow,
-};
+use tauri::{Emitter, Manager, State, WebviewWindow};
 
-const WINDOW: &str = "pet";
+use claude::Haiku;
+use settings::{Lang, Settings};
+
+pub const WINDOW: &str = "pet";
 const CURSOR_POLL: Duration = Duration::from_millis(16);
 const REFIT_EVERY: u32 = 120;
 
@@ -33,6 +34,25 @@ struct Cursor {
     y: f64,
 }
 
+pub struct AppState {
+    settings_path: PathBuf,
+    pub settings: Mutex<Settings>,
+    pub haiku: Arc<Haiku>,
+    pub listening: Arc<AtomicBool>,
+    pub watching: Arc<AtomicBool>,
+    pub token: String,
+    idle_busy: AtomicBool,
+}
+
+impl AppState {
+    /// Changes the saved preferences and writes them to disk.
+    pub fn update(&self, change: impl FnOnce(&mut Settings)) {
+        let mut settings = self.settings.lock().unwrap();
+        change(&mut settings);
+        settings.save(&self.settings_path);
+    }
+}
+
 #[tauri::command]
 fn set_click_through(window: WebviewWindow, enabled: bool) -> Result<(), String> {
     window
@@ -40,48 +60,25 @@ fn set_click_through(window: WebviewWindow, enabled: bool) -> Result<(), String>
         .map_err(|e| e.to_string())
 }
 
-/// Haiku access for the frontend's idle chatter.
-struct Brain {
-    cli: Option<PathBuf>,
-    workdir: PathBuf,
-    llm: Arc<AtomicBool>,
-    busy: AtomicBool,
-}
-
-impl Brain {
-    fn phrases(&self, context: &str, count: u32) -> Result<Vec<String>, String> {
-        if !self.llm.load(Ordering::Relaxed) {
-            return Err("disabled".into());
-        }
-        let cli = self.cli.as_ref().ok_or("claude CLI not found")?;
-        if self.busy.swap(true, Ordering::AcqRel) {
-            return Err("busy".into());
-        }
-        let result = claude::ask(cli, &self.workdir, &claude::idle_prompt(context, count.clamp(1, 10)));
-        self.busy.store(false, Ordering::Release);
-        result.map(|out| claude::phrases(&out, 50))
-    }
-}
-
 #[tauri::command]
-async fn claude_phrases(brain: State<'_, Arc<Brain>>, context: String, count: u32) -> Result<Vec<String>, String> {
-    let brain = brain.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || brain.phrases(&context, count))
-        .await
-        .map_err(|e| e.to_string())?
+fn get_language(state: State<'_, Arc<AppState>>) -> Lang {
+    state.haiku.lang()
 }
 
-#[derive(Clone, Serialize)]
-struct Notice {
-    phrase: &'static str,
-}
-
-struct Toggles {
-    listening: Arc<AtomicBool>,
-    watching: Arc<AtomicBool>,
-    llm: Arc<AtomicBool>,
-    has_cli: bool,
-    token: String,
+/// A batch of idle lines from Haiku for the pet's chatter.
+#[tauri::command]
+async fn claude_phrases(state: State<'_, Arc<AppState>>, context: String, count: u32) -> Result<Vec<String>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if state.idle_busy.swap(true, Ordering::AcqRel) {
+            return Err("busy".to_string());
+        }
+        let result = state.haiku.run(|lang| claude::idle_prompt(lang, &context, count.clamp(1, 10)));
+        state.idle_busy.store(false, Ordering::Release);
+        result.map(|out| claude::phrases(&out, 50))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn main() {
@@ -89,7 +86,8 @@ fn main() {
     prepare_linux_env();
 
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![set_click_through, claude_phrases])
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![set_click_through, get_language, claude_phrases])
         .setup(|app| {
             let window = app
                 .get_webview_window(WINDOW)
@@ -101,37 +99,50 @@ fn main() {
             spawn_cursor_poller(window.clone());
 
             let data_dir = app.path().app_data_dir()?;
+            let settings_path = app.path().app_config_dir()?.join("settings.json");
+            let settings = Settings::load(&settings_path);
             let workdir = data_dir.join("haiku");
             fs::create_dir_all(&workdir)?;
             // Claude Code reports cwd with symlinks resolved.
             #[cfg(unix)]
             let workdir = fs::canonicalize(&workdir).unwrap_or(workdir);
-            let cli = claude::find_cli();
-            let toggles = Toggles {
-                listening: Arc::new(AtomicBool::new(true)),
-                watching: Arc::new(AtomicBool::new(true)),
-                llm: Arc::new(AtomicBool::new(cli.is_some())),
-                has_cli: cli.is_some(),
+
+            let state = Arc::new(AppState {
+                settings_path,
+                haiku: Arc::new(Haiku {
+                    workdir,
+                    cli: RwLock::new(None),
+                    lang: RwLock::new(settings.language),
+                    enabled: AtomicBool::new(settings.llm),
+                }),
+                listening: Arc::new(AtomicBool::new(settings.listen)),
+                watching: Arc::new(AtomicBool::new(settings.watch)),
                 token: hooks::load_token(&data_dir),
-            };
-            app.manage(Arc::new(Brain {
-                cli: cli.clone(),
-                workdir: workdir.clone(),
-                llm: toggles.llm.clone(),
-                busy: AtomicBool::new(false),
-            }));
+                idle_busy: AtomicBool::new(false),
+                settings: Mutex::new(settings),
+            });
+            app.manage(state.clone());
+
+            // Looking through the login shell can take a few seconds; don't hold up startup.
+            let haiku = state.haiku.clone();
+            let saved = state.settings.lock().unwrap().claude_path.clone();
+            thread::spawn(move || {
+                let found = claude::find_cli(saved.as_deref());
+                eprintln!("claude: {}", found.as_deref().map_or("not found".into(), |p| p.display().to_string()));
+                *haiku.cli.write().unwrap() = found;
+            });
 
             let w = window.clone();
-            audio::spawn(toggles.listening.clone(), move |e| send(&w, "audio", e));
+            audio::spawn(state.listening.clone(), move |e| send(&w, "audio", e));
             let w = window.clone();
-            context::spawn(toggles.watching.clone(), move |e| send(&w, "context", e));
+            context::spawn(state.watching.clone(), move |e| send(&w, "context", e));
             let w = window.clone();
-            let hub = hooks::Hub::new(cli, workdir, toggles.llm.clone(), move |e| send(&w, "claude", e));
-            if let Err(e) = hooks::serve(toggles.token.clone(), hub) {
+            let hub = hooks::Hub::new(state.haiku.clone(), move |e| send(&w, "claude", e));
+            if let Err(e) = hooks::serve(state.token.clone(), hub) {
                 eprintln!("Claude Code hook endpoint unavailable: {e}");
             }
 
-            build_tray(app, toggles)?;
+            tray::build(app, state)?;
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -213,99 +224,4 @@ fn spawn_cursor_poller(window: WebviewWindow) {
             }
         }
     });
-}
-
-fn build_tray(app: &App, toggles: Toggles) -> tauri::Result<()> {
-    let hooks_installed = hooks::settings_path().is_some_and(|p| hooks::is_installed(&p));
-    let recall = MenuItem::with_id(app, "recall", "Позвать Clawd", true, None::<&str>)?;
-    let toggle = MenuItem::with_id(app, "toggle", "Спрятать", true, None::<&str>)?;
-    let listen = CheckMenuItem::with_id(app, "listen", "Слушать звук", true, true, None::<&str>)?;
-    let watch = CheckMenuItem::with_id(app, "watch", "Видеть окна и печать", true, true, None::<&str>)?;
-    let llm_label = if toggles.has_cli {
-        "Реплики через Claude (Haiku)"
-    } else {
-        "Реплики через Claude (не найден claude)"
-    };
-    let llm = CheckMenuItem::with_id(app, "llm", llm_label, toggles.has_cli, toggles.has_cli, None::<&str>)?;
-    let link = CheckMenuItem::with_id(app, "hooks", "Связать с Claude Code", true, hooks_installed, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &recall,
-            &toggle,
-            &PredefinedMenuItem::separator(app)?,
-            &listen,
-            &watch,
-            &llm,
-            &link,
-            &PredefinedMenuItem::separator(app)?,
-            &quit,
-        ],
-    )?;
-
-    let mut tray = TrayIconBuilder::with_id("clawd")
-        .tooltip("Clawd")
-        .menu(&menu)
-        .show_menu_on_left_click(true);
-    if let Some(icon) = app.default_window_icon() {
-        tray = tray.icon(icon.clone());
-    }
-    tray.on_menu_event(move |app, event| match event.id.as_ref() {
-        "recall" => {
-            set_visible(app, &toggle, true);
-            let _ = app.emit_to(WINDOW, "recall", ());
-        }
-        "toggle" => {
-            let visible = app
-                .get_webview_window(WINDOW)
-                .and_then(|w| w.is_visible().ok())
-                .unwrap_or(false);
-            set_visible(app, &toggle, !visible);
-        }
-        "listen" => {
-            let on = listen.is_checked().unwrap_or(true);
-            toggles.listening.store(on, Ordering::Relaxed);
-        }
-        "watch" => {
-            let on = watch.is_checked().unwrap_or(true);
-            toggles.watching.store(on, Ordering::Relaxed);
-            if !on {
-                // Make the pet forget what it saw.
-                let _ = app.emit_to(WINDOW, "context", context::ContextEvent::Window { app: String::new(), title: String::new() });
-                let _ = app.emit_to(WINDOW, "context", context::ContextEvent::Typing { kpm: 0 });
-            }
-        }
-        "llm" => {
-            toggles.llm.store(llm.is_checked().unwrap_or(false), Ordering::Relaxed);
-        }
-        "hooks" => {
-            let on = link.is_checked().unwrap_or(false);
-            let result = hooks::settings_path()
-                .ok_or_else(|| "home directory not found".to_string())
-                .and_then(|path| hooks::set_installed(&path, on.then_some(toggles.token.as_str())));
-            let phrase = match result {
-                Ok(()) if on => "hooks_on",
-                Ok(()) => "hooks_off",
-                Err(e) => {
-                    eprintln!("Claude Code hooks: {e}");
-                    let _ = link.set_checked(!on);
-                    "hooks_error"
-                }
-            };
-            let _ = app.emit_to(WINDOW, "notice", Notice { phrase });
-        }
-        "quit" => app.exit(0),
-        _ => {}
-    })
-    .build(app)?;
-    Ok(())
-}
-
-fn set_visible(app: &AppHandle, toggle: &MenuItem<tauri::Wry>, visible: bool) {
-    let Some(window) = app.get_webview_window(WINDOW) else {
-        return;
-    };
-    let _ = if visible { window.show() } else { window.hide() };
-    let _ = toggle.set_text(if visible { "Спрятать" } else { "Показать" });
 }

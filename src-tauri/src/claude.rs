@@ -2,56 +2,262 @@
 //! mode, so it runs on the user's own Claude Code login and needs no API key.
 
 use std::{
-    env,
+    env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        RwLock,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-const TIMEOUT: Duration = Duration::from_secs(90);
+use crate::settings::Lang;
 
-const PERSONA: &str = "Ты — Clawd, маленький оранжевый пиксельный питомец, талисман Claude Code. \
-Ты живёшь на рабочем столе пользователя: гуляешь по панели задач, читаешь, программируешь, \
-танцуешь под музыку и болеешь за пользователя. Говоришь по-русски, от первого лица, очень коротко, \
-дружелюбно и с лёгким гиковским юмором. Отвечай только самими репликами: без кавычек, эмодзи, \
-нумерации, markdown и пояснений.";
+/// Haiku as the rest of the app sees it: where `claude` lives, which language
+/// to speak and whether it's switched on. All of these can change at runtime.
+pub struct Haiku {
+    pub workdir: PathBuf,
+    pub cli: RwLock<Option<PathBuf>>,
+    pub lang: RwLock<Lang>,
+    pub enabled: AtomicBool,
+}
 
-/// Locates the `claude` executable: $CLAWD_CLAUDE_PATH, then PATH, then the usual install spots.
-pub fn find_cli() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("CLAWD_CLAUDE_PATH").map(PathBuf::from) {
-        return path.is_file().then_some(path);
+impl Haiku {
+    pub fn lang(&self) -> Lang {
+        *self.lang.read().unwrap()
     }
-    let names: &[&str] = if cfg!(windows) {
+
+    pub fn cli(&self) -> Option<PathBuf> {
+        self.cli.read().unwrap().clone()
+    }
+
+    /// Runs a prompt written for the current language.
+    pub fn run(&self, prompt: impl FnOnce(Lang) -> String) -> Result<String, String> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Err("disabled".into());
+        }
+        let cli = self.cli().ok_or("claude CLI not found")?;
+        let lang = self.lang();
+        ask(&cli, &self.workdir, lang, &prompt(lang))
+    }
+}
+
+const TIMEOUT: Duration = Duration::from_secs(90);
+const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn persona(lang: Lang) -> String {
+    format!(
+        "You are Clawd, a tiny orange pixel-art pet and the mascot of Claude Code. You live on the user's \
+         desktop: you stroll along the taskbar, read, code, dance to music and cheer the user on. You speak \
+         {}, in the first person, very briefly, warmly and with light geeky humour. Reply with the lines \
+         only: no quotes, emoji, numbering, markdown or explanations.",
+        lang.name()
+    )
+}
+
+fn exe_names() -> &'static [&'static str] {
+    if cfg!(windows) {
         &["claude.exe", "claude.cmd"]
     } else {
         &["claude"]
+    }
+}
+
+/// Subfolders of `dir` (e.g. one per installed Node version), newest name first.
+fn subdirs(dir: &Path, suffix: &[&str]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| suffix.iter().fold(e.path(), |p, s| p.join(s)))
+        .collect();
+    found.sort();
+    found.reverse();
+    found
+}
+
+/// Where installers put `claude` besides PATH. A desktop launcher often starts
+/// apps without the PATH set up in ~/.bashrc or ~/.zshrc (nvm, volta, ...).
+fn install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let Some(home) = home_dir() else {
+        return dirs;
     };
-    let mut dirs: Vec<PathBuf> = env::var_os("PATH")
-        .map(|p| env::split_paths(&p).collect())
-        .unwrap_or_default();
-    if let Some(home) = home_dir() {
-        dirs.push(home.join(".local").join("bin"));
-        dirs.push(home.join(".claude").join("local"));
-        if cfg!(windows) {
-            if let Some(appdata) = env::var_os("APPDATA") {
-                dirs.push(PathBuf::from(appdata).join("npm"));
+    dirs.push(home.join(".local").join("bin"));
+    dirs.push(home.join(".claude").join("local"));
+    if cfg!(windows) {
+        let var = |name: &str| env::var_os(name).map(PathBuf::from);
+        if let Some(appdata) = var("APPDATA") {
+            dirs.push(appdata.join("npm"));
+            dirs.extend(subdirs(&appdata.join("nvm"), &[]));
+            // Claude Desktop keeps its own copy of Claude Code.
+            dirs.extend(subdirs(&appdata.join("Claude").join("claude-code"), &[]));
+        }
+        if let Some(local) = var("LOCALAPPDATA") {
+            dirs.push(local.join("pnpm"));
+            dirs.push(local.join("Volta").join("bin"));
+        }
+        dirs.push(home.join("scoop").join("shims"));
+        if let Some(program_files) = var("ProgramFiles") {
+            dirs.push(program_files.join("nodejs"));
+        }
+    } else {
+        for rel in [".npm-global/bin", ".volta/bin", ".bun/bin", ".local/share/pnpm", ".yarn/bin", ".asdf/shims", ".local/share/mise/shims"] {
+            dirs.push(home.join(rel));
+        }
+        dirs.extend(subdirs(&home.join(".nvm/versions/node"), &["bin"]));
+        dirs.extend(subdirs(&home.join(".local/share/fnm/node-versions"), &["installation", "bin"]));
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/snap/bin"] {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs
+}
+
+/// PATH as the user's shell sees it, which may differ from the one Clawd was started with.
+fn shell_lookup() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        // The registry has the PATH from user and system settings, even if it changed after login.
+        let mut dirs = Vec::new();
+        for key in [r"HKCU\Environment", r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"] {
+            let Ok(out) = run_with_timeout(Command::new("reg").args(["query", key, "/v", "Path"]), VERSION_TIMEOUT) else {
+                continue;
+            };
+            for line in out.lines() {
+                if let Some((_, value)) = line.split_once("REG_EXPAND_SZ").or_else(|| line.split_once("REG_SZ")) {
+                    dirs.extend(value.trim().split(';').map(|d| PathBuf::from(expand_env(d))));
+                }
+            }
+        }
+        find_in(&dirs)
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let out = run_with_timeout(Command::new(shell).args(["-ilc", "command -v claude"]), VERSION_TIMEOUT).ok()?;
+        out.lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('/'))
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+    }
+}
+
+#[cfg(windows)]
+fn expand_env(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        match rest[start + 1..].find('%') {
+            Some(len) => {
+                let name = &rest[start + 1..start + 1 + len];
+                out.push_str(&env::var(name).unwrap_or_else(|_| format!("%{name}%")));
+                rest = &rest[start + len + 2..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                rest = "";
             }
         }
     }
+    out.push_str(rest);
+    out
+}
+
+fn find_in(dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.iter()
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .flat_map(|dir| exe_names().iter().map(move |name| dir.join(name)))
         .find(|path| path.is_file())
+}
+
+/// Locates the `claude` executable: a path the user picked, $CLAWD_CLAUDE_PATH,
+/// PATH, the usual install folders, and finally the user's login shell.
+pub fn find_cli(saved: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = saved.filter(|p| p.is_file()) {
+        return Some(path.to_path_buf());
+    }
+    if let Some(path) = env::var_os("CLAWD_CLAUDE_PATH").map(PathBuf::from) {
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let mut dirs: Vec<PathBuf> = env::var_os("PATH")
+        .map(|p| env::split_paths(&p).collect())
+        .unwrap_or_default();
+    dirs.extend(install_dirs());
+    find_in(&dirs).or_else(shell_lookup)
 }
 
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
 
+fn hide_console(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Runs a short command and returns its stdout, giving up after `timeout`.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<String, String> {
+    hide_console(cmd);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let reader = thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        out
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("timed out".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let out = reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(out)
+    } else {
+        Err(format!("exited with {status}"))
+    }
+}
+
+/// Checks that `path` really is Claude Code; returns its version line.
+pub fn verify(path: &Path) -> Result<String, String> {
+    let out = run_with_timeout(Command::new(path).arg("--version"), VERSION_TIMEOUT)?;
+    let line = out.lines().next().unwrap_or_default().trim().to_string();
+    if line.contains("Claude Code") || line.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        Ok(line)
+    } else {
+        Err(format!("unexpected --version output: {line}"))
+    }
+}
+
 /// Runs one headless Haiku turn with no tools, MCP servers, skills or hooks.
 /// `workdir` is a private folder, so no project CLAUDE.md gets loaded.
-pub fn ask(cli: &Path, workdir: &Path, prompt: &str) -> Result<String, String> {
+pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str) -> Result<String, String> {
+    let persona = persona(lang);
     let mut cmd = Command::new(cli);
     cmd.args([
         "-p",
@@ -67,19 +273,14 @@ pub fn ask(cli: &Path, workdir: &Path, prompt: &str) -> Result<String, String> {
         "--settings",
         r#"{"disableAllHooks":true}"#,
         "--system-prompt",
-        PERSONA,
+        &persona,
     ])
     .current_dir(workdir)
     .env("CLAWD_INTERNAL", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    hide_console(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| format!("cannot start claude: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -143,25 +344,27 @@ pub fn phrases(output: &str, max_chars: usize) -> Vec<String> {
     seen
 }
 
-pub fn idle_prompt(context: &str, count: u32) -> String {
+pub fn idle_prompt(lang: Lang, context: &str, count: u32) -> String {
     format!(
-        "Что сейчас происходит:\n{context}\n\nПридумай {count} разных коротких реплик (до 40 символов), \
-         которые Clawd мог бы сказать прямо сейчас. Можно подшутить над контекстом. По одной на строку."
+        "What is going on right now:\n{context}\n\nWrite {count} different short lines (up to 40 characters) \
+         that Clawd could say right now, in {}. Teasing the situation a little is welcome. One per line.",
+        lang.name()
     )
 }
 
-pub fn thought_prompt(task_text: &str) -> String {
+pub fn thought_prompt(lang: Lang, task_text: &str) -> String {
     format!(
-        "Claude сейчас работает над задачей пользователя и пишет:\n\n{task_text}\n\n\
-         Перескажи это одной короткой репликой (до 50 символов) — как мысль вслух Clawd, \
-         будто это он делает работу."
+        "Claude is working on the user's task and writes:\n\n{task_text}\n\nRetell it as one short line \
+         (up to 50 characters) in {}: Clawd thinking out loud, as if he were doing the work.",
+        lang.name()
     )
 }
 
-pub fn done_prompt(project: &str, last_message: &str) -> String {
+pub fn done_prompt(lang: Lang, project: &str, last_message: &str) -> String {
     format!(
-        "Claude закончил задачу в проекте «{project}». Его итоговое сообщение:\n\n{last_message}\n\n\
-         Одной короткой репликой (до 60 символов) скажи пользователю, что сделано и что стоит проверить."
+        "Claude finished a task in the project \"{project}\". Its final message:\n\n{last_message}\n\n\
+         In one short line (up to 60 characters) in {}, tell the user what was done and what to check.",
+        lang.name()
     )
 }
 

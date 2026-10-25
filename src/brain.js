@@ -1,4 +1,5 @@
 // Clawd's "brain": what's going on around him, and a stash of lines from Claude Haiku.
+// The situation is described to Haiku in English; Rust tells it which language to answer in.
 
 const CACHE_TTL = 180;
 const REFILL_EVERY = 60;
@@ -6,24 +7,24 @@ const WINDOW_COMMENT_EVERY = 60;
 const APP_FORGET_AFTER = 15 * 60;
 
 const STATE_NAMES = {
-  idle: "просто стоит",
-  walk: "гуляет по панели задач",
-  read: "читает книжку",
-  code: "программирует за ноутбуком",
-  think: "о чём-то думает",
-  dance: "танцует",
-  sleep: "спит",
-  fly: "летит, его бросили",
-  hang: "висит на краю экрана",
-  drag: "его тащат мышкой",
-  pet: "его гладят",
+  idle: "just standing around",
+  walk: "strolling along the taskbar",
+  read: "reading a book",
+  code: "coding on a laptop",
+  think: "thinking about something",
+  dance: "dancing",
+  sleep: "sleeping",
+  fly: "flying through the air, someone threw him",
+  hang: "hanging from the edge of the screen",
+  drag: "being dragged by the mouse",
+  pet: "being petted",
 };
 
 const DAY_PARTS = [
-  [5, "утро"],
-  [12, "день"],
-  [18, "вечер"],
-  [23, "ночь"],
+  [5, "morning"],
+  [12, "afternoon"],
+  [18, "evening"],
+  [23, "night"],
 ];
 
 export class Brain {
@@ -37,6 +38,13 @@ export class Brain {
     this.kpm = 0;
     this.appSeen = new Map();
     this.lastWindowComment = -Infinity;
+  }
+
+  // Drops lines in the old language and asks again right away.
+  forget() {
+    this.cache = [];
+    this.available = true;
+    this.lastRequest = -Infinity;
   }
 
   // Returns an app name worth commenting on when the user switches to a new app.
@@ -62,19 +70,19 @@ export class Brain {
   describe(pet, now, extra = "") {
     const date = new Date();
     const hour = date.getHours();
-    const part = [...DAY_PARTS].reverse().find(([h]) => hour >= h)?.[1] ?? "ночь";
-    const time = date.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
-    const weekday = date.toLocaleDateString("ru-RU", { weekday: "long" });
-    const lines = [`- Сейчас ${time}, ${part}, ${weekday}.`];
+    const part = [...DAY_PARTS].reverse().find(([h]) => hour >= h)?.[1] ?? "night";
+    const time = date.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+    const weekday = date.toLocaleDateString("en-GB", { weekday: "long" });
+    const lines = [`- It is ${time}, ${part}, ${weekday}.`];
     if (this.window) {
       const app = this.window.app ? ` (${this.window.app})` : "";
-      lines.push(`- У пользователя открыто окно: «${this.window.title}»${app}.`);
+      lines.push(`- The user has this window open: "${this.window.title}"${app}.`);
     }
-    if (this.kpm > 0) lines.push(`- Пользователь печатает, примерно ${this.kpm} нажатий в минуту.`);
-    if (pet.music) lines.push("- Играет музыка.");
-    lines.push(`- Clawd сейчас ${STATE_NAMES[pet.state] || "занят своими делами"}.`);
+    if (this.kpm > 0) lines.push(`- The user is typing, about ${this.kpm} key presses a minute.`);
+    if (pet.music) lines.push("- Music is playing.");
+    lines.push(`- Clawd is ${STATE_NAMES[pet.state] || "busy with his own things"}.`);
     const projects = [...pet.claudeSessions.values()].map((s) => s.project).filter(Boolean);
-    if (projects.length) lines.push(`- Claude Code сейчас работает над задачей в проекте ${projects.join(", ")}.`);
+    if (projects.length) lines.push(`- Claude Code is working on a task in ${projects.join(", ")}.`);
     if (extra) lines.push(`- ${extra}`);
     return lines.join("\n");
   }
@@ -114,7 +122,7 @@ export class Brain {
   // One line about the window the user just switched to.
   comment(pet, now, app) {
     if (this.pending || !this.available) return Promise.resolve(null);
-    const context = this.describe(pet, now, `Пользователь только что переключился на ${app}.`);
+    const context = this.describe(pet, now, `The user just switched to ${app}.`);
     return this.ask(context, 1).then((lines) => lines[0] ?? null);
   }
 }

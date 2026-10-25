@@ -7,10 +7,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +15,10 @@ use std::{
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::claude;
+use crate::{
+    claude::{self, Haiku},
+    settings::Lang,
+};
 
 pub const PORT: u16 = 47823;
 const MARKER: &str = "127.0.0.1:47823/hook/";
@@ -167,33 +167,23 @@ struct Session {
 }
 
 pub struct Hub {
-    pub cli: Option<PathBuf>,
-    pub workdir: PathBuf,
-    pub llm: Arc<AtomicBool>,
+    haiku: Arc<Haiku>,
     sessions: Mutex<HashMap<String, Session>>,
     emit: Box<dyn Fn(ClaudeEvent) + Send + Sync>,
 }
 
 impl Hub {
-    pub fn new(
-        cli: Option<PathBuf>,
-        workdir: PathBuf,
-        llm: Arc<AtomicBool>,
-        emit: impl Fn(ClaudeEvent) + Send + Sync + 'static,
-    ) -> Arc<Self> {
+    pub fn new(haiku: Arc<Haiku>, emit: impl Fn(ClaudeEvent) + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
-            cli,
-            workdir,
-            llm,
+            haiku,
             sessions: Mutex::new(HashMap::new()),
             emit: Box::new(emit),
         })
     }
 
-    /// Runs Haiku if it's available and enabled, else falls back to plain text.
-    fn haiku(&self, prompt: &str, max: usize) -> Option<String> {
-        let cli = self.cli.as_ref().filter(|_| self.llm.load(Ordering::Relaxed))?;
-        match claude::ask(cli, &self.workdir, prompt) {
+    /// Runs Haiku if it's available and enabled; None means "fall back to plain text".
+    fn haiku(&self, prompt: impl FnOnce(Lang) -> String, max: usize) -> Option<String> {
+        match self.haiku.run(prompt) {
             Ok(out) => claude::phrases(&out, max).into_iter().next(),
             Err(e) => {
                 eprintln!("haiku: {e}");
@@ -203,7 +193,7 @@ impl Hub {
     }
 
     pub fn handle(self: &Arc<Self>, body: &Value) {
-        let Some(parsed) = parse(body, &self.workdir) else {
+        let Some(parsed) = parse(body, &self.haiku.workdir) else {
             return;
         };
         let latest = || {
@@ -239,7 +229,7 @@ impl Hub {
                 let session = session.clone();
                 thread::spawn(move || {
                     let thought = hub
-                        .haiku(&claude::thought_prompt(&clip(&text, 1500)), 60)
+                        .haiku(|lang| claude::thought_prompt(lang, &clip(&text, 1500)), 60)
                         .unwrap_or_else(|| first_sentence(&text, 60));
                     if let Some(state) = hub.sessions.lock().unwrap().get_mut(&session) {
                         state.thinking = false;
@@ -256,7 +246,7 @@ impl Hub {
                 let (session, project) = (session.clone(), project.clone());
                 thread::spawn(move || {
                     let report = hub
-                        .haiku(&claude::done_prompt(&project, &clip(&text, 2000)), 80)
+                        .haiku(|lang| claude::done_prompt(lang, &project, &clip(&text, 2000)), 80)
                         .unwrap_or_else(|| first_sentence(&text, 70));
                     (hub.emit)(ClaudeEvent::Report { session, project, text: report });
                 });

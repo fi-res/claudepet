@@ -1,6 +1,5 @@
 // Clawd's behaviour: state machine and physics. Units are CSS pixels and seconds.
 import { GRID_W, GRID_H, SPINNER_LENGTH } from "./sprite.js";
-import { TOOL_PHRASES } from "./phrases.js";
 
 const GRAVITY = 2600;
 const WALK_SPEED = 42;
@@ -438,8 +437,7 @@ export class Pet {
         if (!this.claudeWork) this.startWork(now, false);
         if (now < this.nextToolSay) break;
         this.nextToolSay = now + TOOL_SAY_EVERY;
-        const templates = (event.detail && TOOL_PHRASES[event.tool]) || TOOL_PHRASES.default;
-        this.fx.say(templates, true, { detail: event.detail, tool: event.tool });
+        this.fx.say(`tool:${event.tool}`, true, { detail: event.detail, tool: event.tool });
         break;
       }
       case "thought":
