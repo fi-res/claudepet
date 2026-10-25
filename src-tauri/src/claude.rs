@@ -39,9 +39,21 @@ impl Haiku {
         if !self.enabled.load(Ordering::Relaxed) {
             return Err("disabled".into());
         }
+        self.run_with(false, prompt)
+    }
+
+    /// Like `run`, but Haiku may search and read the web while answering.
+    pub fn run_web(&self, prompt: impl FnOnce(Lang) -> String) -> Result<String, String> {
+        self.run_with(true, prompt)
+    }
+
+    fn run_with(&self, web: bool, prompt: impl FnOnce(Lang) -> String) -> Result<String, String> {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return Err("disabled".into());
+        }
         let cli = self.cli().ok_or("claude CLI not found")?;
         let lang = self.lang();
-        ask(&cli, &self.workdir, lang, &prompt(lang))
+        ask(&cli, &self.workdir, lang, &prompt(lang), web)
     }
 }
 
@@ -254,11 +266,16 @@ pub fn verify(path: &Path) -> Result<String, String> {
     }
 }
 
-/// Runs one headless Haiku turn with no tools, MCP servers, skills or hooks.
+/// Runs one headless Haiku turn with no MCP servers, skills or hooks. Its only
+/// possible tools are web search and fetch, when `web` is set; never shell or files.
 /// `workdir` is a private folder, so no project CLAUDE.md gets loaded.
-pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str) -> Result<String, String> {
+pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str, web: bool) -> Result<String, String> {
     let persona = persona(lang);
+    let tools = if web { "WebSearch,WebFetch" } else { "" };
     let mut cmd = Command::new(cli);
+    if web {
+        cmd.args(["--allowedTools", tools]);
+    }
     cmd.args([
         "-p",
         "--model",
@@ -267,7 +284,7 @@ pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str) -> Result<Strin
         "text",
         "--no-session-persistence",
         "--tools",
-        "",
+        tools,
         "--strict-mcp-config",
         "--disable-slash-commands",
         "--settings",
@@ -371,6 +388,15 @@ pub fn done_prompt(lang: Lang, project: &str, last_message: &str) -> String {
     )
 }
 
+/// The shell `run_command` uses, so Haiku writes commands for the right one.
+pub fn shell_name() -> &'static str {
+    if cfg!(windows) {
+        "Windows PowerShell"
+    } else {
+        "sh on Linux"
+    }
+}
+
 /// The prompt for a reply to something the user typed to Clawd in the chat box.
 /// `history` holds earlier turns as (speaker, text), speaker being "user" or "clawd".
 pub fn chat_prompt(lang: Lang, context: &str, history: &[[String; 2]], message: &str) -> String {
@@ -381,17 +407,52 @@ pub fn chat_prompt(lang: Lang, context: &str, history: &[[String; 2]], message: 
     }
     format!(
         "What is going on right now:\n{context}\n\nConversation so far:\n{dialogue}User: {message}\n\n\
-         Answer the user as Clawd, in {}, in one or two short sentences (under 200 characters), staying \
-         in character. If they ask something you can't know, say so playfully.",
-        lang.name()
+         Answer the user as Clawd, in {lang}, in one or two short sentences (under 200 characters), staying \
+         in character. Plain text only, no markdown or links. You may search the web if it helps.\n\n\
+         You can also offer to run ONE shell command on the user's computer ({shell}). The user sees it and \
+         must confirm before it runs. To offer one, put it alone on the last line as: COMMAND: <command>\n\
+         Rules for commands: only when the user asks for something on their computer; prefer read-only \
+         commands; before anything destructive (killing processes, deleting files) first offer a read-only \
+         command that shows exactly what would be affected, and only then the destructive one with concrete \
+         PIDs or paths; never touch the process named clawd or system-critical processes; no sudo, no \
+         interactive programs.",
+        lang = lang.name(),
+        shell = shell_name(),
     )
 }
 
-/// One clean reply for the speech bubble: no quotes or speaker prefix, whitespace collapsed.
+/// A chat answer: what Clawd says, and a shell command he offers to run, if any.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ChatReply {
+    pub text: String,
+    pub command: Option<String>,
+}
+
+/// Turns markdown into plain text for the bubble: drops emphasis marks and keeps link text.
+fn strip_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some(mid) = rest[open..].find("](").map(|i| open + i) else {
+            break;
+        };
+        let Some(close) = rest[mid..].find(')').map(|i| mid + i) else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str(&rest[open + 1..mid]);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace("__", "").replace('`', "")
+}
+
+/// One clean reply for the speech bubble: no quotes, speaker prefix or markdown, whitespace collapsed.
 pub fn reply(output: &str, max_chars: usize) -> Option<String> {
-    let text = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = strip_markdown(output);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let text = text.strip_prefix("Clawd:").unwrap_or(&text).trim();
-    let text = text.trim_matches(|c: char| matches!(c, '"' | '«' | '»' | '“' | '”' | '`')).trim();
+    let text = text.trim_matches(|c: char| matches!(c, '"' | '«' | '»' | '“' | '”')).trim();
     if text.is_empty() {
         return None;
     }
@@ -399,6 +460,24 @@ pub fn reply(output: &str, max_chars: usize) -> Option<String> {
         Some((i, _)) => format!("{}…", text[..i].trim_end()),
         None => text.to_string(),
     })
+}
+
+/// Splits Haiku's chat output into the spoken reply and an offered `COMMAND:` line.
+pub fn parse_chat(output: &str, max_chars: usize) -> Option<ChatReply> {
+    let mut command = None;
+    let mut spoken = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim().trim_matches('`').trim();
+        match trimmed.strip_prefix("COMMAND:") {
+            Some(cmd) if !cmd.trim().is_empty() => command = Some(cmd.trim().to_string()),
+            _ => spoken.push(line),
+        }
+    }
+    let text = reply(&spoken.join("\n"), max_chars);
+    match (text, command) {
+        (None, None) => None,
+        (text, command) => Some(ChatReply { text: text.unwrap_or_default(), command }),
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +497,22 @@ mod tests {
         assert_eq!(reply("Clawd: «Привет!\n  Как дела?»", 200).as_deref(), Some("Привет! Как дела?"));
         assert_eq!(reply("   ", 200), None);
         assert_eq!(reply(&"a".repeat(10), 4).as_deref(), Some("aaaa…"));
+    }
+
+    #[test]
+    fn chat_output_splits_into_reply_and_command() {
+        let out = "Сейчас посмотрю, кто ест память.\nCOMMAND: ps -eo pid,comm,%mem --sort=-%mem | head -5\n";
+        assert_eq!(
+            parse_chat(out, 200),
+            Some(ChatReply {
+                text: "Сейчас посмотрю, кто ест память.".into(),
+                command: Some("ps -eo pid,comm,%mem --sort=-%mem | head -5".into()),
+            })
+        );
+        let plain = parse_chat("**Rust 1.99** вышел, см. [блог](https://blog.rust-lang.org)", 200).unwrap();
+        assert_eq!(plain.text, "Rust 1.99 вышел, см. блог");
+        assert_eq!(plain.command, None);
+        assert_eq!(parse_chat("  \n", 200), None);
     }
 
     #[test]

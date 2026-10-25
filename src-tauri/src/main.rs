@@ -5,6 +5,7 @@ mod claude;
 mod context;
 mod hooks;
 mod settings;
+mod shell;
 mod tray;
 
 use std::{
@@ -88,14 +89,23 @@ async fn claude_chat(
     context: String,
     history: Vec<[String; 2]>,
     message: String,
-) -> Result<String, String> {
+) -> Result<claude::ChatReply, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let out = state.haiku.run(|lang| claude::chat_prompt(lang, &context, &history, &message))?;
-        claude::reply(&out, 220).ok_or_else(|| "empty reply".to_string())
+        let out = state.haiku.run_web(|lang| claude::chat_prompt(lang, &context, &history, &message))?;
+        claude::parse_chat(&out, 220).ok_or_else(|| "empty reply".to_string())
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Runs a command Clawd offered in the chat. The page calls this only after
+/// the user clicked "Run" on the confirmation panel.
+#[tauri::command]
+async fn run_command(command: String) -> Result<shell::CommandResult, String> {
+    tauri::async_runtime::spawn_blocking(move || shell::run(&command))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// The overlay is created unfocused; typing into the chat box needs keyboard focus.
@@ -115,6 +125,7 @@ fn main() {
             get_language,
             claude_phrases,
             claude_chat,
+            run_command,
             focus_window
         ])
         .setup(|app| {
