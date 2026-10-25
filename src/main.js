@@ -1161,8 +1161,6 @@ function tick(ms) {
     refreshLayout();
   }
   fitCanvas();
-  // Resting the cursor on Clawd shows how much of the Claude limit is left.
-  if (pet.hoverSince && now - pet.hoverSince > 0.8) showLimits(2.5);
   if (limitsUntil && now > limitsUntil) {
     limitsUntil = 0;
     limitsBox.classList.remove("open");

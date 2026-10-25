@@ -38,7 +38,7 @@ const CURSOR_POLL: Duration = Duration::from_millis(16);
 const REFIT_EVERY: u32 = 120;
 const MAX_FACTS: usize = 8;
 /// How often Clawd asks `claude -p /usage` for the plan limits on his own.
-const USAGE_EVERY: Duration = Duration::from_secs(10 * 60);
+const USAGE_EVERY: Duration = Duration::from_secs(5 * 60);
 const MAX_RECENT: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
