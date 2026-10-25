@@ -3,6 +3,7 @@
 mod audio;
 mod claude;
 mod context;
+mod files;
 mod hooks;
 mod reminders;
 mod screens;
@@ -24,6 +25,7 @@ use std::{
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, State, WebviewWindow};
+use tauri_plugin_notification::NotificationExt;
 
 use claude::Haiku;
 use context::ContextEvent;
@@ -67,6 +69,7 @@ pub struct AppState {
     monitor: Mutex<Option<String>>,
     pub tray: OnceLock<tray::Tray>,
     pub update: Mutex<Option<tauri_plugin_updater::Update>>,
+    pub hub: OnceLock<Arc<hooks::Hub>>,
 }
 
 impl AppState {
@@ -117,11 +120,15 @@ async fn claude_chat(
     context: String,
     history: Vec<[String; 2]>,
     message: String,
+    files: Option<Vec<files::FedFile>>,
 ) -> Result<claude::ChatReply, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let facts = state.settings.lock().unwrap().memory.facts.clone();
-        let out = state.haiku.run_web(|lang| claude::chat_prompt(lang, &context, &facts, &history, &message))?;
+        let fed = files::prompt_section(&files.unwrap_or_default());
+        let out = state
+            .haiku
+            .run_web(|lang| claude::chat_prompt(lang, &context, &facts, &fed, &history, &message))?;
         claude::parse_chat(&out, 220).ok_or_else(|| "empty reply".to_string())
     })
     .await
@@ -235,6 +242,22 @@ fn save_recent(state: State<'_, Arc<AppState>>, recent: Vec<[String; 2]>) {
     state.update(|s| s.memory.recent = recent.into_iter().skip(skip).collect());
 }
 
+/// A file or folder dropped on Clawd: read (capped) for the chat to talk about.
+#[tauri::command]
+async fn feed_file(path: String) -> Result<files::FedFile, String> {
+    tauri::async_runtime::spawn_blocking(move || files::read(std::path::Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// The user clicked Allow or Deny on a Claude Code permission card.
+#[tauri::command]
+fn answer_permission(state: State<'_, Arc<AppState>>, id: u64, allow: bool) {
+    if let Some(hub) = state.hub.get() {
+        hub.answer_permission(id, allow);
+    }
+}
+
 #[tauri::command]
 fn forget_memory(state: State<'_, Arc<AppState>>) {
     state.update(|s| s.memory = Memory::default());
@@ -253,6 +276,7 @@ fn main() {
             let _ = app.emit_to(WINDOW, "recall", ());
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
@@ -271,7 +295,9 @@ fn main() {
             get_memory,
             remember,
             save_recent,
-            forget_memory
+            forget_memory,
+            answer_permission,
+            feed_file
         ])
         .setup(|app| {
             let window = app
@@ -303,6 +329,7 @@ fn main() {
                 monitor: Mutex::new(None),
                 tray: OnceLock::new(),
                 update: Mutex::new(None),
+                hub: OnceLock::new(),
             });
             app.manage(state.clone());
 
@@ -331,12 +358,18 @@ fn main() {
                 other => send(&w, "context", other),
             });
             let (w, s) = (window.clone(), state.clone());
-            let hub = hooks::Hub::new(state.haiku.clone(), move |e| {
+            let ask = state.settings.lock().unwrap().ask_permissions;
+            let hub = hooks::Hub::new(state.haiku.clone(), ask, move |e| {
                 if let ClaudeEvent::Limits { five_hour, seven_day } = &e {
                     tray::set_limits(&s, five_hour.clone(), seven_day.clone());
                 }
+                // A permission question needs Clawd on screen, even if he was hidden.
+                if matches!(e, ClaudeEvent::Permission { .. }) {
+                    let _ = w.show();
+                }
                 send(&w, "claude", e);
             });
+            let _ = state.hub.set(hub.clone());
             if let Err(e) = hooks::serve(state.token.clone(), hub) {
                 eprintln!("Claude Code hook endpoint unavailable: {e}");
             }
@@ -349,8 +382,18 @@ fn main() {
             }
 
             let (w, s) = (window.clone(), state.clone());
+            let app_handle = app.handle().clone();
             reminders::spawn(state.clone(), move |r| {
+                // A hidden Clawd comes back for this, and Windows shows a notification
+                // (with its sound) in case he's behind a fullscreen window.
+                let _ = w.show();
                 send(&w, "remind", Remind { text: r.text.clone() });
+                let _ = app_handle
+                    .notification()
+                    .builder()
+                    .title("⏰ Clawd")
+                    .body(if r.text.is_empty() { "⏰" } else { r.text.as_str() })
+                    .show();
                 tray::refresh(&s);
             });
 

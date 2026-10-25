@@ -125,6 +125,27 @@ mod platform {
         net_active_window: Atom,
         net_wm_name: Atom,
         utf8_string: Atom,
+        frame: FrameAtoms,
+    }
+
+    /// EWMH properties that say where a window's frame is and whether it's one to stand on.
+    struct FrameAtoms {
+        pid: Atom,
+        state: Atom,
+        maximized_vert: Atom,
+        maximized_horz: Atom,
+        hidden: Atom,
+        fullscreen: Atom,
+        window_type: Atom,
+        type_desktop: Atom,
+        type_dock: Atom,
+        frame_extents: Atom,
+        gtk_frame_extents: Atom,
+    }
+
+    /// A property made of 32-bit values (CARDINAL, ATOM).
+    fn words(raw: &[u8]) -> Vec<u32> {
+        raw.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
     impl Probe {
@@ -135,12 +156,26 @@ mod platform {
             let net_active_window = atom(b"_NET_ACTIVE_WINDOW")?;
             let net_wm_name = atom(b"_NET_WM_NAME")?;
             let utf8_string = atom(b"UTF8_STRING")?;
+            let frame = FrameAtoms {
+                pid: atom(b"_NET_WM_PID")?,
+                state: atom(b"_NET_WM_STATE")?,
+                maximized_vert: atom(b"_NET_WM_STATE_MAXIMIZED_VERT")?,
+                maximized_horz: atom(b"_NET_WM_STATE_MAXIMIZED_HORZ")?,
+                hidden: atom(b"_NET_WM_STATE_HIDDEN")?,
+                fullscreen: atom(b"_NET_WM_STATE_FULLSCREEN")?,
+                window_type: atom(b"_NET_WM_WINDOW_TYPE")?,
+                type_desktop: atom(b"_NET_WM_WINDOW_TYPE_DESKTOP")?,
+                type_dock: atom(b"_NET_WM_WINDOW_TYPE_DOCK")?,
+                frame_extents: atom(b"_NET_FRAME_EXTENTS")?,
+                gtk_frame_extents: atom(b"_GTK_FRAME_EXTENTS")?,
+            };
             Some(Self {
                 conn,
                 root,
                 net_active_window,
                 net_wm_name,
                 utf8_string,
+                frame,
             })
         }
 
@@ -154,12 +189,14 @@ mod platform {
             Some(reply.value)
         }
 
-        pub fn active_window(&self) -> Option<(String, String)> {
+        fn focused(&self) -> Option<Window> {
             let raw = self.property(self.root, self.net_active_window, AtomEnum::WINDOW.into())?;
             let window = u32::from_ne_bytes(raw.get(..4)?.try_into().ok()?);
-            if window == 0 {
-                return None;
-            }
+            (window != 0).then_some(window)
+        }
+
+        pub fn active_window(&self) -> Option<(String, String)> {
+            let window = self.focused()?;
             let title = self
                 .property(window, self.net_wm_name, self.utf8_string)
                 .filter(|t| !t.is_empty())
@@ -177,9 +214,50 @@ mod platform {
             Some((app, String::from_utf8_lossy(&title).into_owned()))
         }
 
-        /// Not tracked on X11 yet: Clawd only stands on the panel there.
+        /// None when the focused window is Clawd's own overlay: clicking him
+        /// shouldn't knock him off the window he's sitting on.
         pub fn frame(&self) -> Option<Option<[i32; 4]>> {
-            None
+            let a = &self.frame;
+            let Some(window) = self.focused() else {
+                return Some(None);
+            };
+            let cardinal: Atom = AtomEnum::CARDINAL.into();
+            let atom_type: Atom = AtomEnum::ATOM.into();
+            let pid = self.property(window, a.pid, cardinal).map(|r| words(&r));
+            if pid.as_ref().and_then(|p| p.first()) == Some(&std::process::id()) {
+                return None;
+            }
+            let state = self.property(window, a.state, atom_type).map(|r| words(&r)).unwrap_or_default();
+            let maximized = state.contains(&a.maximized_vert) && state.contains(&a.maximized_horz);
+            if maximized || state.contains(&a.hidden) || state.contains(&a.fullscreen) {
+                return Some(None);
+            }
+            let kinds = self.property(window, a.window_type, atom_type).map(|r| words(&r)).unwrap_or_default();
+            if kinds.contains(&a.type_desktop) || kinds.contains(&a.type_dock) {
+                return Some(None);
+            }
+            let Some(geometry) = self.conn.get_geometry(window).ok().and_then(|c| c.reply().ok()) else {
+                return Some(None);
+            };
+            let Some(origin) = self.conn.translate_coordinates(window, self.root, 0, 0).ok().and_then(|c| c.reply().ok())
+            else {
+                return Some(None);
+            };
+            let (x, y) = (i32::from(origin.dst_x), i32::from(origin.dst_y));
+            let (w, h) = (i32::from(geometry.width), i32::from(geometry.height));
+            // The window manager's title bar sits outside the window (_NET_FRAME_EXTENTS);
+            // GTK's own title bars sit inside, under a shadow margin (_GTK_FRAME_EXTENTS).
+            let extents = |atom| {
+                let v = self.property(window, atom, cardinal).map(|r| words(&r)).unwrap_or_default();
+                if v.len() == 4 { [v[0], v[1], v[2], v[3]].map(|e| e as i32) } else { [0; 4] }
+            };
+            let [l, r, t, b] = extents(a.frame_extents);
+            let [gl, gr, gt, gb] = extents(a.gtk_frame_extents);
+            let rect = [x - l + gl, y - t + gt, x + w + r - gr, y + h + b - gb];
+            if rect[2] - rect[0] < 160 || rect[3] - rect[1] < 80 {
+                return Some(None);
+            }
+            Some(Some(rect))
         }
 
         pub fn keys(&self) -> KeyBits {

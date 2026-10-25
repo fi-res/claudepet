@@ -50,6 +50,7 @@ fn text(lang: Lang, key: &str) -> &'static str {
         "pick" => if ru { "Указать путь к claude…" } else { "Locate claude…" },
         "hooks" => if ru { "Связать с Claude Code" } else { "Connect to Claude Code" },
         "autostart" => if ru { "Запускать вместе с системой" } else { "Start with the system" },
+        "ask" => if ru { "Разрешения Claude Code через Clawd" } else { "Claude Code permissions via Clawd" },
         "check_update" => if ru { "Проверить обновления" } else { "Check for updates" },
         "quit" => if ru { "Выход" } else { "Quit" },
         "pick_title" => if ru { "Где находится claude?" } else { "Where is claude?" },
@@ -113,6 +114,7 @@ struct Items {
     forget: MenuItem<Wry>,
     limits: MenuItem<Wry>,
     link: CheckMenuItem<Wry>,
+    ask: CheckMenuItem<Wry>,
     listen: CheckMenuItem<Wry>,
     watch: CheckMenuItem<Wry>,
     llm: CheckMenuItem<Wry>,
@@ -138,6 +140,7 @@ impl Items {
         let _ = self.feed.set_text(text(lang, "feed"));
         let _ = self.forget.set_text(text(lang, "forget"));
         let _ = self.link.set_text(text(lang, "hooks"));
+        let _ = self.ask.set_text(text(lang, "ask"));
         let _ = self.listen.set_text(text(lang, "listen"));
         let _ = self.watch.set_text(text(lang, "watch"));
         let _ = self.llm.set_text(text(lang, "llm"));
@@ -204,6 +207,7 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
         forget: item("forget", text(lang, "forget"), true)?,
         limits: item("limits", &limits_text(lang, None), false)?,
         link: CheckMenuItem::with_id(app, "hooks", text(lang, "hooks"), true, hooks_installed, None::<&str>)?,
+        ask: check("ask", settings.ask_permissions)?,
         listen: check("listen", settings.listen)?,
         watch: check("watch", settings.watch)?,
         llm: check("llm", settings.llm)?,
@@ -230,6 +234,7 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
             &separator()?,
             &items.limits,
             &items.link,
+            &items.ask,
             &separator()?,
             &items.listen,
             &items.watch,
@@ -317,6 +322,13 @@ pub fn build(app: &App, state: Arc<AppState>) -> tauri::Result<()> {
                     }
                 };
                 notice(app, phrase);
+            }
+            "ask" => {
+                let on = items.ask.is_checked().unwrap_or(true);
+                state.update(|s| s.ask_permissions = on);
+                if let Some(hub) = state.hub.get() {
+                    hub.ask_permissions.store(on, Ordering::Relaxed);
+                }
             }
             "autostart" => {
                 let on = items.autostart.is_checked().unwrap_or(false);

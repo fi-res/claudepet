@@ -11,6 +11,9 @@ use serde::Serialize;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT: usize = 4000;
+/// Windows PowerShell 5.1 writes redirected output in the console's OEM code page
+/// (cp866 for Russian), so Cyrillic and emoji come out garbled; switch it to UTF-8 first.
+const UTF8_PRELUDE: &str = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8; ";
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CommandResult {
@@ -23,7 +26,7 @@ pub struct CommandResult {
 fn shell(command: &str) -> Command {
     if cfg!(windows) {
         let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &format!("{UTF8_PRELUDE}{command}")]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -36,6 +39,35 @@ fn shell(command: &str) -> Command {
         cmd.args(["-c", command]);
         cmd
     }
+}
+
+/// Output as text. Old console programs (ping, ipconfig...) still print in the OEM
+/// code page whatever PowerShell is set to, so bytes that aren't UTF-8 are read as that.
+fn decode(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => from_oem(e.into_bytes()),
+    }
+}
+
+#[cfg(windows)]
+fn from_oem(bytes: Vec<u8>) -> String {
+    use windows::Win32::Globalization::{MultiByteToWideChar, CP_OEMCP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
+    unsafe {
+        let len = MultiByteToWideChar(CP_OEMCP, flags, &bytes, None);
+        if len <= 0 {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let mut wide = vec![0u16; len as usize];
+        MultiByteToWideChar(CP_OEMCP, flags, &bytes, Some(&mut wide));
+        String::from_utf16_lossy(&wide)
+    }
+}
+
+#[cfg(not(windows))]
+fn from_oem(bytes: Vec<u8>) -> String {
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Keeps the end of long output: that's where results and errors usually are.
@@ -63,7 +95,7 @@ pub fn run(command: &str) -> Result<CommandResult, String> {
         thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = pipe.read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
+            decode(buf)
         })
     };
     let stdout = read_all(Box::new(child.stdout.take().expect("stdout is piped")));
@@ -116,5 +148,24 @@ mod tests {
         let long = "x".repeat(10) + "END";
         assert_eq!(tail(&long, 5), "…xxEND");
         assert_eq!(tail("short", 5), "short");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn powershell_output_keeps_cyrillic() {
+        let out = run("Write-Output 'Привет, мир'").unwrap();
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.output, "Привет, мир");
+    }
+
+    #[test]
+    fn non_utf8_bytes_fall_back_to_the_oem_code_page() {
+        assert_eq!(decode("ok".as_bytes().to_vec()), "ok");
+        // Whatever the OEM code page is, invalid UTF-8 must still come out as text.
+        assert!(!decode(vec![0x8f, 0xe0, 0xa8]).is_empty());
     }
 }

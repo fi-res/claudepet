@@ -23,6 +23,7 @@ const STATE_NAMES = {
   coffee: "drinking coffee",
   pizza: "eating a slice of pizza",
   chase: "playing tag with the mouse cursor",
+  eat: "munching on a file the user fed him",
 };
 
 const DAY_PARTS = [

@@ -42,8 +42,11 @@ const SAD = 30;
 const BREAK_AFTER = 60 * 60;
 const BREAK_GAP = 5 * 60;
 const BREAK_NAG_EVERY = 20 * 60;
+// A reminder rings right away and then every REMIND_REPEAT seconds, REMIND_TIMES
+// times in all; Clawd keeps jumping with his alarm clock for REMIND_LOUD seconds.
 const REMIND_REPEAT = 30;
-const REMIND_TIMES = 3;
+const REMIND_TIMES = 5;
+const REMIND_LOUD = 180;
 const SESSION_TIMEOUT = 10 * 60;
 const TOOL_SAY_EVERY = 8;
 const FAST_TYPING_KPM = 250;
@@ -64,7 +67,8 @@ export function season(date = new Date()) {
 }
 
 export class Pet {
-  // `fx` receives side effects: say(category, force) and spawn(kind).
+  // `fx` receives side effects: say(category, force, vars), sayText(text, force, hold, kind)
+  // and spawn(kind); `kind` ranks the line so chatter can't cover the conversation.
   constructor(unit, fx) {
     this.fx = fx;
     this.setUnit(unit);
@@ -152,6 +156,8 @@ export class Pet {
     this.lastBreakNag = -Infinity;
     this.reminder = null;
     this.limitWarned = new Map();
+    // The cursor is over a box above Clawd (chat, reminder card).
+    this.uiHover = false;
   }
 
   setUnit(unit) {
@@ -293,35 +299,38 @@ export class Pet {
     this.fx.say("feed_thanks", true);
   }
 
-  // A reminder from the chat went off: get the user's attention a few times.
+  // A reminder went off: Clawd drops what he's doing and rings an alarm clock
+  // until the user dismisses the reminder card (or clicks him).
   remind(text, now) {
     if (this.state === "sleep") this.wakeUp(now, "wake");
-    this.reminder = { text, count: 1, next: now + REMIND_REPEAT };
-    this.ringReminder(now);
+    const busy = ACTIVITY_STATES.has(this.state) && !this.claudeWork;
+    if (busy || this.state === "dance" || this.state === "chase") this.state = "idle";
+    this.lastInteraction = now;
+    this.reminder = { text, since: now, count: 0, next: now, nextHop: now + 0.3 };
+    this.fx.say("remind_ring", true);
   }
 
-  ringReminder(now) {
-    this.waveUntil = now + 2.5;
-    this.setExpr("surprised", 0.8, now);
-    this.hop(520);
-    this.fx.sayText(`⏰ ${this.reminder.text}`, true, 12);
-  }
-
-  ackReminder() {
+  ackReminder(now) {
     if (!this.reminder) return;
     this.reminder = null;
+    this.setExpr("happy", 1.2, now);
   }
 
   stepReminder(now) {
     const r = this.reminder;
-    if (!r || now < r.next) return;
-    if (r.count >= REMIND_TIMES) {
-      this.reminder = null;
-      return;
+    if (!r) return;
+    this.lastInteraction = now;
+    if (now >= r.next && r.count < REMIND_TIMES) {
+      r.count++;
+      r.next = now + REMIND_REPEAT;
+      this.fx.ring();
     }
-    r.count++;
-    r.next = now + REMIND_REPEAT;
-    this.ringReminder(now);
+    const free = this.state === "idle" || this.state === "walk";
+    if (now >= r.nextHop && now - r.since < REMIND_LOUD && free && !this.uiHover) {
+      r.nextHop = now + rand(1, 1.5);
+      this.hop(440);
+      this.fx.spawn("alert");
+    }
   }
 
   // A long stretch at the computer without a pause earns a nudge to stretch.
@@ -340,15 +349,16 @@ export class Pet {
 
   onLimits(event, now) {
     const five = event.five_hour;
-    if (!five) return;
+    if (!five) return false;
     const reset = five.resets_at ? new Date(five.resets_at * 1000) : null;
     const key = reset ? reset.getTime() : 0;
     const level = five.used >= 95 ? 95 : five.used >= 80 ? 80 : 0;
-    if (!level || (this.limitWarned.get(key) || 0) >= level) return;
+    if (!level || (this.limitWarned.get(key) || 0) >= level) return false;
     this.limitWarned.set(key, level);
     const time = reset ? reset.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
     this.setExpr("surprised", 1, now);
     this.fx.say(level >= 95 ? "limit_high" : "limit_warn", true, { pct: Math.round(five.used), time });
+    return true;
   }
 
   get held() {
@@ -473,6 +483,9 @@ export class Pet {
       case "chase":
         this.stepChase(dt, now);
         break;
+      case "eat":
+        this.stepEat(now);
+        break;
       case "dance":
         this.stepDance(now);
         break;
@@ -582,6 +595,8 @@ export class Pet {
     }
 
     if (this.updateHover(now)) return;
+    // Ringing a reminder: no wandering off or starting something else.
+    if (this.reminder) return;
 
     const attention = this.attention(now);
     if (attention !== null) this.look = attention;
@@ -808,6 +823,42 @@ export class Pet {
     this.fed = false;
   }
 
+  // A file is being dragged over Clawd: he looks up expectantly.
+  expectFood(now) {
+    if (this.state === "sleep") this.wakeUp(now, "wake");
+    this.setExpr("surprised", 0.4, now);
+    this.look = 0;
+    this.lastInteraction = now;
+  }
+
+  // A file was dropped on him: a few bites of a paper sheet.
+  eatFile(now) {
+    if (this.state === "sleep") this.napUntil = 0;
+    if (this.held || this.claudeWork) return;
+    this.state = "eat";
+    this.look = 0;
+    this.bites = 0;
+    this.activityStart = now;
+    this.nextActivityEvent = now + 0.35;
+    this.vitals.food = clamp100(this.vitals.food + 4);
+  }
+
+  stepEat(now) {
+    const maxY = this.floorY();
+    if (this.y < maxY - 0.5) this.y = Math.min(maxY, this.y + 6);
+    if (now < this.nextActivityEvent) return;
+    this.nextActivityEvent = now + 0.4;
+    this.bites++;
+    this.biteUntil = now + 0.2;
+    this.fx.spawn("crumb");
+    if (this.bites <= 3) return;
+    this.state = "idle";
+    this.nextAction = now + rand(2, 4);
+    this.setExpr("happy", 1.4, now);
+    this.hop(380);
+    this.fx.spawn("spark");
+  }
+
   // Tag: Clawd runs after the cursor along the floor and jumps when it's above him.
   stepChase(dt, now) {
     const [minX, maxX] = this.walkRange();
@@ -920,15 +971,18 @@ export class Pet {
       case "tool": {
         touch();
         if (!this.claudeWork) this.startWork(now, false);
-        if (now < this.nextToolSay) break;
+        // Shell commands are always shown; other tools at most every few seconds.
+        const shell = event.tool === "Bash" || event.tool === "PowerShell";
+        if (!shell && now < this.nextToolSay) break;
         this.nextToolSay = now + TOOL_SAY_EVERY;
-        this.fx.say(`tool:${event.tool}`, true, { detail: event.detail, tool: event.tool });
+        this.fx.say(`tool:${event.tool}`, true, { detail: event.detail, tool: event.tool, background: event.background });
         break;
       }
       case "thought":
         if (sessions.has(id)) touch();
         this.nextToolSay = now + TOOL_SAY_EVERY;
-        this.fx.sayText(event.text, true);
+        // Play-by-play: fine to skip while the user is talking to Clawd.
+        this.fx.sayText(event.text, true, 0, "ephemeral");
         break;
       case "attention":
         touch();
@@ -1314,6 +1368,11 @@ export class Pet {
       arms = Math.floor(now * 3) % 2 ? "paint1" : "paint2";
       eyes = "down";
       look = 1;
+    } else if (state === "eat") {
+      [arms, prop, bites] = ["hold", "doc", this.bites];
+      eyes = now < this.biteUntil ? "happy" : "open";
+      squash = now < this.biteUntil ? 1 : 0;
+      look = 0;
     } else if (state === "chase") {
       legs = Math.floor(now * 12) % 2 ? "walk1" : "walk2";
       arms = Math.floor(now * 6) % 2 ? "wave1" : "wave2";
@@ -1358,6 +1417,14 @@ export class Pet {
       eyes = "up";
       spinner = Math.floor(now * 8) % SPINNER_LENGTH;
     }
+    let ring = 0;
+    if (this.reminder && (state === "idle" || state === "walk")) {
+      [prop, arms] = ["clock", "hold"];
+      const loud = now - this.reminder.since < REMIND_LOUD;
+      ring = loud ? [-1, 0, 1, 0][Math.floor(now * 16) % 4] : 0;
+      eyes = loud && Math.floor(now * 2) % 2 ? "surprised" : "open";
+      look = 0;
+    }
     const canBlink = ["idle", "walk", "hang", "code", "think", "coffee", "pizza"].includes(state);
     if (now < this.blinkUntil && (eyes === "open" || eyes === "up") && canBlink) eyes = "blink";
     if (legs === "tuck" && squash) squash = 0;
@@ -1367,7 +1434,7 @@ export class Pet {
     const outfit = season();
     const hat = outfit === "santa" && !cap && !phones ? "santa" : null;
     const pumpkin = outfit === "pumpkin" && !prop && (state === "idle" || state === "walk") && arms !== "wave1";
-    return { eyes, look, arms, legs, squash, blush, prop, cap, phones, spinner, flip, bites, paint, sip, hat, pumpkin };
+    return { eyes, look, arms, legs, squash, blush, prop, cap, phones, spinner, flip, bites, paint, sip, hat, pumpkin, ring };
   }
 
   rotation(now) {
@@ -1389,7 +1456,7 @@ export class Pet {
     if (this.state === "chase") {
       this.endChase(true, now);
     }
-    this.ackReminder();
+    if (this.reminder) this.fx.dismissReminder();
     const wasSleeping = this.state === "sleep";
     const interrupted = ACTIVITY_STATES.has(this.state) || this.state === "dance" ? this.state : null;
     this.lastInteraction = now;

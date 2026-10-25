@@ -16,6 +16,32 @@
         <button id="confirm-cancel" type="button"></button>
       </div>
     </div>
+    <div id="output">
+      <div class="output-head">
+        <code id="output-cmd"></code>
+        <button id="output-close" type="button">×</button>
+      </div>
+      <pre id="output-text"></pre>
+      <div id="output-status"></div>
+    </div>
+    <div id="reminder" class="pixel-card" role="alert">
+      <div class="card-head"><canvas class="card-icon" id="reminder-icon"></canvas><span id="reminder-title"></span></div>
+      <div class="card-text" id="reminder-text"></div>
+      <div class="card-row">
+        <button id="reminder-done" class="primary" type="button"></button>
+        <button id="reminder-snooze" type="button"></button>
+      </div>
+    </div>
+    <div id="permission" class="pixel-card" role="alertdialog">
+      <div class="card-head"><canvas class="card-icon" id="permission-icon"></canvas><span id="permission-title"></span></div>
+      <div class="card-note" id="permission-what"></div>
+      <code id="permission-cmd"></code>
+      <div class="card-row">
+        <button id="permission-allow" class="primary" type="button"></button>
+        <button id="permission-deny" type="button"></button>
+      </div>
+    </div>
+    <div id="limits" class="pixel-card"></div>
     <form id="chat" autocomplete="off"><input id="chat-input" maxlength="300" spellcheck="false" /></form>
     <script type="module" src="main.js"></script>
   </body>

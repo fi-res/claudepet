@@ -33,6 +33,9 @@ const PUMPKIN_COLOR = "#f28c1b";
 const PUMPKIN_SHADE = "#c96a0e";
 const PUMPKIN_FACE = "#3a1f00";
 const STEM_COLOR = "#4f8a2b";
+const CLOCK_RED = "#d64545";
+const CLOCK_BELL = "#f2c230";
+const CLOCK_FACE = "#ffffff";
 // Dots Clawd paints onto the canvas one by one: [x, y] inside it and a colour.
 const PAINT = [
   [1, 0, "#e94f4f"], [5, 1, "#4f8de9"], [3, 0, "#f2c230"], [6, 0, "#5cbf5c"],
@@ -60,6 +63,7 @@ const PARTICLE_COLORS = {
   note: "#6fb8ff",
   steam: "#e3e3e3",
   crumb: "#e0a040",
+  alert: "#e04848",
 };
 
 const PATTERNS = {
@@ -70,6 +74,7 @@ const PATTERNS = {
   note: ["..XXXXX", "..X...X", "..X...X", "..X...X", "XXX.XXX", "XXX.XXX"],
   steam: [".X.", "X..", ".X.", "..X", ".X."],
   crumb: ["X.X", ".X.", "X.."],
+  alert: ["XX.XX", "XX.XX", "XX.XX", ".....", "XX.XX"],
 };
 
 function mix(a, b, t) {
@@ -113,6 +118,7 @@ export function drawPet(ctx, frame, s) {
     sip = false,
     hat = null,
     pumpkin = false,
+    ring = 0,
   } = frame;
   ctx.clearRect(0, 0, GRID_W * s, GRID_H * s);
   const px = (x0, y0, x1, y1, color) => {
@@ -235,6 +241,8 @@ export function drawPet(ctx, frame, s) {
   else if (prop === "mug") drawMug(px, left, right, bottom, sip);
   else if (prop === "pizza") drawPizza(px, left, right, bottom, bites);
   else if (prop === "easel") drawEasel(px, left, right, bottom, paint);
+  else if (prop === "clock") drawClock(px, left, right, bottom, ring);
+  else if (prop === "doc") drawDoc(px, left, right, bottom, bites);
   if (cap) drawCap(px, left, right, top);
   if (hat === "santa") drawSantaHat(px, left, right, top);
   if (pumpkin) drawPumpkin(px, left, bottom);
@@ -332,6 +340,36 @@ function drawEasel(px, left, right, bottom, paint) {
   });
 }
 
+// A sheet of paper (a file the user fed him); bites take it from the top corner.
+function drawDoc(px, left, right, bottom, bites) {
+  const x0 = Math.round((left + right) / 2) - 3;
+  const y0 = bottom - 6;
+  const eaten = Math.min(bites, 3);
+  for (let row = 0; row < 6; row++) {
+    const cut = Math.max(0, eaten * 2 - row);
+    if (cut >= 6) continue;
+    px(x0, y0 + row, x0 + 6 - cut, y0 + row + 1, BOOK_PAGE);
+    if (row % 2 === 1 && row < 5) px(x0 + 1, y0 + row, x0 + Math.max(1, 5 - cut), y0 + row + 1, BOOK_TEXT);
+  }
+  if (!eaten) px(x0 + 5, y0, x0 + 6, y0 + 1, BOOK_FOLD);
+  px(x0 - 1, y0 + 2, x0, y0 + 4, BODY_COLOR);
+  px(x0 + 6, y0 + 2, x0 + 7, y0 + 4, BODY_COLOR);
+}
+
+// A ringing alarm clock held up in front; `ring` (-1, 0, 1) shakes it sideways.
+function drawClock(px, left, right, bottom, ring) {
+  const x0 = Math.round((left + right) / 2) - 3 + ring;
+  const y0 = bottom - 6;
+  px(x0, y0, x0 + 2, y0 + 1, CLOCK_BELL);
+  px(x0 + 4, y0, x0 + 6, y0 + 1, CLOCK_BELL);
+  px(x0, y0 + 1, x0 + 6, y0 + 6, CLOCK_RED);
+  px(x0 + 1, y0 + 2, x0 + 5, y0 + 5, CLOCK_FACE);
+  px(x0 + 3, y0 + 2, x0 + 4, y0 + 4, EYE_COLOR);
+  px(x0 + 3, y0 + 3, x0 + 5, y0 + 4, EYE_COLOR);
+  px(x0 - 1, y0 + 3, x0, y0 + 5, BODY_COLOR);
+  px(x0 + 6, y0 + 3, x0 + 7, y0 + 5, BODY_COLOR);
+}
+
 // Santa hat with a white trim, flopping to the right with a pompom.
 function drawSantaHat(px, left, right, top) {
   px(left, top - 1, right, top, SANTA_WHITE);
@@ -357,6 +395,52 @@ function drawCap(px, left, right, top) {
   px(left + 3, top - 2, right - 2, top - 1, CAP_COLOR);
   px(right - 4, top - 3, right - 1, top - 2, CAP_COLOR);
   px(right - 1, top - 3, right + 1, top - 1, POMPOM_COLOR);
+}
+
+// Multi-colour pixel icons for the page around Clawd; letters map to ICON_COLORS.
+const ICON_COLORS = { B: CLOCK_BELL, R: CLOCK_RED, W: CLOCK_FACE, K: EYE_COLOR, G: LAPTOP_EDGE };
+const ICONS = {
+  clock: [
+    ".BB.....BB.",
+    "BBB.....BBB",
+    "BB.RRRRR.BB",
+    "..RWWWWWR..",
+    ".RWWWKWWWR.",
+    ".RWWWKWWWR.",
+    ".RWWWKKKWR.",
+    ".RWWWWWWWR.",
+    "..RWWWWWR..",
+    "...RRRRR...",
+    "..R.....R..",
+  ],
+  lock: [
+    "...GGGGG...",
+    "..G.....G..",
+    "..G.....G..",
+    "..G.....G..",
+    ".BBBBBBBBB.",
+    ".BBBBBBBBB.",
+    ".BBBBKBBBB.",
+    ".BBBBKBBBB.",
+    ".BBBBBBBBB.",
+    ".BBBBBBBBB.",
+    "...........",
+  ],
+};
+
+// Draws icon `name` into `canvas`, `s` device pixels per cell.
+export function drawIcon(canvas, name, s) {
+  const rows = ICONS[name];
+  canvas.width = rows[0].length * s;
+  canvas.height = rows.length * s;
+  const ctx = canvas.getContext("2d");
+  rows.forEach((row, y) => {
+    [...row].forEach((ch, x) => {
+      if (ch === ".") return;
+      ctx.fillStyle = ICON_COLORS[ch];
+      ctx.fillRect(x * s, y * s, s, s);
+    });
+  });
 }
 
 export function particleCanvas(kind, s) {

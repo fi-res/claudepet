@@ -401,7 +401,15 @@ pub fn shell_name() -> &'static str {
 
 /// The prompt for a reply to something the user typed to Clawd in the chat box.
 /// `history` holds earlier turns as (speaker, text), speaker being "user" or "clawd".
-pub fn chat_prompt(lang: Lang, context: &str, memory: &[String], history: &[[String; 2]], message: &str) -> String {
+/// `fed` is the section with files the user dropped on Clawd (see files::prompt_section).
+pub fn chat_prompt(
+    lang: Lang,
+    context: &str,
+    memory: &[String],
+    fed: &str,
+    history: &[[String; 2]],
+    message: &str,
+) -> String {
     let mut dialogue = String::new();
     for [who, text] in history.iter().rev().take(8).rev() {
         let who = if who == "user" { "User" } else { "Clawd" };
@@ -414,7 +422,7 @@ pub fn chat_prompt(lang: Lang, context: &str, memory: &[String], history: &[[Str
         format!("What you remember about the user from earlier chats: {}\n\n", memory.join("; "))
     };
     format!(
-        "What is going on right now:\n{context}\n\n{remembered}Conversation so far:\n{dialogue}User: {message}\n\n\
+        "What is going on right now:\n{context}\n\n{remembered}{fed}Conversation so far:\n{dialogue}User: {message}\n\n\
          Answer the user as Clawd, in {lang}, in one or two short sentences (under 200 characters), staying \
          in character. Plain text only, no markdown or links. You may search the web if it helps.\n\n\
          If the user asks to be reminded of something later, add a line: REMIND: <minutes from now> | <short \
@@ -566,11 +574,12 @@ mod tests {
     #[test]
     fn chat_prompt_keeps_recent_turns() {
         let history: Vec<[String; 2]> = (0..12).map(|i| ["user".into(), format!("m{i}")]).collect();
-        let prompt = chat_prompt(Lang::En, "- ctx", &[], &history, "hi");
+        let prompt = chat_prompt(Lang::En, "- ctx", &[], "", &history, "hi");
         assert!(!prompt.contains("User: m3\n") && prompt.contains("User: m4\n") && prompt.contains("User: hi"));
         assert!(!prompt.contains("remember about the user"));
-        let prompt = chat_prompt(Lang::En, "- ctx", &["name is Max".into()], &history, "hi");
+        let prompt = chat_prompt(Lang::En, "- ctx", &["name is Max".into()], "FILES\n", &history, "hi");
         assert!(prompt.contains("from earlier chats: name is Max"));
+        assert!(prompt.contains("FILES\nConversation so far"));
     }
 
     #[test]

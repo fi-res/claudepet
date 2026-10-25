@@ -1,7 +1,8 @@
 import { Pet } from "./pet.js";
-import { GRID_W, GRID_H, drawPet, particleCanvas } from "./sprite.js";
+import { GRID_W, GRID_H, drawIcon, drawPet, particleCanvas } from "./sprite.js";
 import { PHRASES, TOOL_PHRASES } from "./phrases.js";
 import { Brain } from "./brain.js";
+import { highlightCommand, renderAnsi } from "./terminal.js";
 
 const UNIT = 5;
 const MAX_PARTICLES = 14;
@@ -25,6 +26,25 @@ const confirmCmd = document.getElementById("confirm-cmd");
 const confirmWarn = document.getElementById("confirm-warn");
 const confirmRun = document.getElementById("confirm-run");
 const confirmCancel = document.getElementById("confirm-cancel");
+const outputBox = document.getElementById("output");
+const outputCmd = document.getElementById("output-cmd");
+const outputText = document.getElementById("output-text");
+const outputStatus = document.getElementById("output-status");
+const outputClose = document.getElementById("output-close");
+const reminderBox = document.getElementById("reminder");
+const reminderTitle = document.getElementById("reminder-title");
+const reminderLine = document.getElementById("reminder-text");
+const reminderIcon = document.getElementById("reminder-icon");
+const reminderDone = document.getElementById("reminder-done");
+const reminderSnooze = document.getElementById("reminder-snooze");
+const permissionBox = document.getElementById("permission");
+const permissionIcon = document.getElementById("permission-icon");
+const permissionTitle = document.getElementById("permission-title");
+const permissionWhat = document.getElementById("permission-what");
+const permissionCmd = document.getElementById("permission-cmd");
+const permissionAllow = document.getElementById("permission-allow");
+const permissionDeny = document.getElementById("permission-deny");
+const limitsBox = document.getElementById("limits");
 const ctx = canvas.getContext("2d");
 
 const nowSec = () => performance.now() / 1000;
@@ -36,19 +56,79 @@ let frameKey = null;
 let particles = 0;
 let lastPhrase = null;
 let bubbleUntil = 0;
-let bubbleImportant = false;
 let lang = navigator.language?.toLowerCase().startsWith("ru") ? "ru" : "en";
 let chatOpen = false;
 let chatHistory = [];
 
 const PLACEHOLDER = { ru: "Напиши Clawd… (Esc — закрыть)", en: "Message Clawd… (Esc to close)" };
 const UI = {
-  ru: { run: "Выполнить", cancel: "Отмена", danger: "⚠ Осторожно: команда может что-то удалить или остановить", running: "Выполняю…", declined: "Ладно, не буду" },
-  en: { run: "Run", cancel: "Cancel", danger: "⚠ Careful: this may delete or stop something", running: "Running…", declined: "Okay, I won't" },
+  ru: {
+    run: "Выполнить",
+    cancel: "Отмена",
+    danger: "⚠ Осторожно: команда может что-то удалить или остановить",
+    running: "Выполняю…",
+    declined: "Ладно, не буду",
+    exit: "✓ готово",
+    failed: "✗ код выхода {code}",
+    timeout: "⏱ остановлена через 30 с",
+    error: "✗ не запустилась",
+    close: "Закрыть",
+    reminder: "Напоминание",
+    done: "Готово",
+    snooze: "Через 5 мин",
+    permission: "Claude Code спрашивает",
+    background: "в фоне",
+    careful: "Осторожно",
+    allow: "Разрешить",
+    deny: "Запретить",
+    wants: { Bash: "хочет выполнить команду", PowerShell: "хочет выполнить команду", Edit: "хочет изменить файл", MultiEdit: "хочет изменить файл", Write: "хочет записать файл", Read: "хочет прочитать файл", WebFetch: "хочет открыть страницу", WebSearch: "хочет поискать в сети" },
+    wantsOther: "хочет использовать {tool}",
+    in: "в {project}",
+    fiveHour: "5 ч",
+    week: "Нед.",
+  },
+  en: {
+    run: "Run",
+    cancel: "Cancel",
+    danger: "⚠ Careful: this may delete or stop something",
+    running: "Running…",
+    declined: "Okay, I won't",
+    exit: "✓ done",
+    failed: "✗ exit code {code}",
+    timeout: "⏱ stopped after 30 s",
+    error: "✗ failed to start",
+    close: "Close",
+    reminder: "Reminder",
+    done: "Done",
+    snooze: "In 5 min",
+    permission: "Claude Code asks",
+    background: "in the background",
+    careful: "Careful",
+    allow: "Allow",
+    deny: "Deny",
+    wants: { Bash: "wants to run a command", PowerShell: "wants to run a command", Edit: "wants to edit a file", MultiEdit: "wants to edit a file", Write: "wants to write a file", Read: "wants to read a file", WebFetch: "wants to open a page", WebSearch: "wants to search the web" },
+    wantsOther: "wants to use {tool}",
+    in: "in {project}",
+    fiveHour: "5h",
+    week: "Week",
+  },
 };
 // Commands that delete, kill, power off or rewrite disks get a red warning.
 const DANGER = /\b(rm|rmdir|del|erase|kill|killall|pkill|taskkill|stop-process|remove-item|shutdown|reboot|poweroff|halt|mkfs|format|dd|chmod|chown|truncate|shred|wipefs|diskpart|reg\s+delete)\b|>\s*\/dev\/|:\(\)\s*\{/i;
 let pendingCommand = null;
+let outputOpen = false;
+// Reminders that went off and wait for "Done"; the first one is on the card.
+let reminders = [];
+// Claude Code permission questions waiting for Allow / Deny; the first one is on the card.
+let permissions = [];
+// Files the user fed Clawd (newest last); they go along with chat messages for a while.
+let fedFiles = [];
+let fedAt = 0;
+const MAX_FED = 3;
+const FED_FOR = 30 * 60;
+// The plan's usage from Claude Code's status line, and until when the limit bubble shows.
+let limits = null;
+let limitsUntil = 0;
 
 const brain = new Brain(invoke);
 const pet = new Pet(UNIT, {
@@ -57,10 +137,27 @@ const pet = new Pet(UNIT, {
   spawn,
   hideBubble,
   cross: crossEdge,
+  ring: chime,
+  dismissReminder: () => finishReminder(false),
 });
 
-// In a plain browser, expose the pet for poking at from the dev console.
+// In a plain browser, expose the pet and the chat panels for poking at from the dev console.
 if (!tauri) window.clawd = pet;
+if (!tauri) window.clawdUi = { openChat, showConfirm, showOutput, sayText, say, remind: (text) => {
+  reminders.push(text);
+  if (reminders.length === 1) showReminder();
+}, permission: (ask) => {
+  permissions.push(ask);
+  if (permissions.length === 1) showPermission();
+}, limits: (value) => {
+  limits = value;
+  showLimits(30);
+}, feed: (file) => {
+  pet.eatFile(nowSec());
+  fedFiles = [...fedFiles, file].slice(-MAX_FED);
+  fedAt = nowSec();
+  say("file_eaten", true, { name: file.name });
+}, fed: () => fedFiles };
 
 // After a move to another monitor the page may report the old size for a frame
 // or two; use the size Rust gave us until it catches up.
@@ -103,8 +200,39 @@ function linesFor(category, vars) {
   return PHRASES[lang][category] || [category];
 }
 
+// How much a line matters. A bubble is only replaced by a line that matters at
+// least as much, so Claude Code's play-by-play can't cover Clawd's answer in the chat.
+const PRIORITY = { chatter: 0, ephemeral: 1, event: 2, talk: 3 };
+// Lines that belong to the conversation with the user.
+const TALK = new Set([
+  "chat_hello",
+  "chat_error",
+  "chat_error_disabled",
+  "chat_error_missing",
+  "chat_error_auth",
+  "chat_error_timeout",
+  "chat_error_limit",
+  "remind_set",
+  "pomodoro_set",
+  "reminders_cleared",
+  "forgot",
+]);
+let bubblePriority = 0;
+// An event that came while the user was reading an answer; shown right after it.
+let pendingEvent = null;
+
+function kindOf(category, force) {
+  if (category.startsWith("tool:")) return "ephemeral";
+  if (TALK.has(category)) return "talk";
+  return force ? "event" : "chatter";
+}
+
 // `vars` fill {placeholders}; lines that need a missing one are skipped.
 function say(category, force = false, vars = {}) {
+  // Claude Code's shell commands look like a terminal line, not like Clawd talking.
+  if ((category === "tool:Bash" || category === "tool:PowerShell") && vars.detail) {
+    return sayCommand(vars.detail, vars.background);
+  }
   if (category === "idle" && Math.random() < 0.75) {
     const generated = brain.take();
     if (generated) return sayText(generated, force);
@@ -114,19 +242,46 @@ function say(category, force = false, vars = {}) {
   const phrases = usable.length ? usable : all;
   const options = phrases.filter((p) => p !== lastPhrase);
   const text = pick(options.length ? options : phrases).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
-  sayText(text, force);
+  sayText(text, force, 0, kindOf(category, force));
 }
 
-// Forced lines (Claude's thoughts, reports) aren't talked over by idle chatter.
-// `hold` keeps the bubble up for at least that many seconds.
-function sayText(text, force = false, hold = 0) {
+// `hold` keeps the bubble up for at least that many seconds; `kind` is a PRIORITY key.
+function sayText(text, force = false, hold = 0, kind = force ? "event" : "chatter") {
   const now = nowSec();
-  if (!force && bubbleImportant && now < bubbleUntil) return;
+  const priority = PRIORITY[kind] ?? 0;
+  // While the chat box is open, Claude Code's play-by-play stays quiet.
+  if (kind === "ephemeral" && (chatOpen || pet.awaitingReply)) return;
+  if (now < bubbleUntil && priority < bubblePriority) {
+    if (kind === "event") pendingEvent = { text, hold, at: now };
+    return;
+  }
   lastPhrase = text;
-  bubbleImportant = force;
+  bubblePriority = priority;
+  bubble.classList.remove("term");
   bubble.textContent = text;
   bubble.classList.add("visible");
   bubbleUntil = now + Math.max(hold, 3.5 + text.length * 0.08);
+}
+
+// A command Claude Code is running, as a small highlighted terminal block. One that
+// runs in the background is labelled so and stays up longer: nothing else will say
+// it's still going.
+function sayCommand(command, background = false) {
+  const now = nowSec();
+  if (chatOpen || pet.awaitingReply) return;
+  if (now < bubbleUntil && PRIORITY.ephemeral < bubblePriority) return;
+  lastPhrase = command;
+  bubblePriority = PRIORITY.ephemeral;
+  const content = highlightCommand(command);
+  if (background) {
+    const tag = document.createElement("span");
+    tag.className = "tok-bg";
+    tag.textContent = `⏳ ${UI[lang].background}`;
+    content.prepend(tag);
+  }
+  bubble.replaceChildren(content);
+  bubble.classList.add("term", "visible");
+  bubbleUntil = now + (background ? 8 : 3.5) + Math.min(command.length, 120) * 0.04;
 }
 
 // One line from a category, for text that's stored rather than spoken right away.
@@ -134,10 +289,15 @@ function phrase(category) {
   return pick(PHRASES[lang][category] || [category]);
 }
 
-function hideBubble() {
+// The pet hides the bubble when he dozes off; that never cuts the conversation short.
+function hideBubble(expired = false) {
+  if (!expired && bubblePriority >= PRIORITY.talk && nowSec() < bubbleUntil) return;
   bubble.classList.remove("visible");
   bubbleUntil = 0;
-  bubbleImportant = false;
+  bubblePriority = 0;
+  const pending = pendingEvent;
+  pendingEvent = null;
+  if (expired && pending && nowSec() - pending.at < 30) sayText(pending.text, true, pending.hold, "event");
 }
 
 function spawn(kind) {
@@ -190,29 +350,41 @@ function render(now) {
   const y = pet.y + pet.hopOff;
   canvas.style.transform = `translate(${pet.x}px, ${y}px) rotate(${pet.rotation(now)}deg)`;
 
-  if (bubbleUntil && now >= bubbleUntil) hideBubble();
+  if (bubbleUntil && now >= bubbleUntil) hideBubble(true);
+  const margin = 4;
+  const centered = (el) => Math.min(Math.max(pet.x + pet.w / 2 - el.offsetWidth / 2, margin), window.innerWidth - el.offsetWidth - margin);
+  // The boxes stay put while Clawd hops, so their buttons don't jump away from the cursor.
+  let top = pet.y + pet.unit;
+  for (const el of stack()) {
+    // Pixel cards draw their border outside the box, so they need a wider gap.
+    const gap = el.classList.contains("pixel-card") ? margin + 8 : margin;
+    top = Math.max(top - el.offsetHeight - gap, margin);
+    el.style.transform = `translate(${centered(el)}px, ${top}px)`;
+  }
   if (bubble.classList.contains("visible")) {
-    const bw = bubble.offsetWidth;
-    const bh = bubble.offsetHeight;
-    const margin = 4;
-    const bx = Math.min(Math.max(pet.x + pet.w / 2 - bw / 2, margin), window.innerWidth - bw - margin);
-    const lift = chatOpen ? chatForm.offsetHeight + margin + (pendingCommand ? confirmBox.offsetHeight + margin : 0) : 0;
-    let by = y + pet.unit - bh - margin - lift;
+    let by = top - bubble.offsetHeight - margin;
     if (by < 0) by = y + pet.h + margin;
-    bubble.style.transform = `translate(${bx}px, ${by}px)`;
+    bubble.style.transform = `translate(${centered(bubble)}px, ${by}px)`;
   }
-  if (chatOpen) {
-    const cw = chatForm.offsetWidth;
-    const cx = Math.min(Math.max(pet.x + pet.w / 2 - cw / 2, 4), window.innerWidth - cw - 4);
-    const cy = Math.max(y + pet.unit - chatForm.offsetHeight - 4, 4);
-    chatForm.style.transform = `translate(${cx}px, ${cy}px)`;
-    if (pendingCommand) {
-      const bw = confirmBox.offsetWidth;
-      const bx = Math.min(Math.max(pet.x + pet.w / 2 - bw / 2, 4), window.innerWidth - bw - 4);
-      const by = Math.max(cy - confirmBox.offsetHeight - 4, 4);
-      confirmBox.style.transform = `translate(${bx}px, ${by}px)`;
-    }
-  }
+}
+
+// What sits above the chat box: a command waiting for "Run", or the last command's output.
+function activePanel() {
+  if (pendingCommand) return confirmBox;
+  return outputOpen ? outputBox : null;
+}
+
+// The boxes above Clawd, bottom to top: chat, its panel, a reminder, a permission
+// question and the limit bubble.
+function stack() {
+  const items = [];
+  if (chatOpen) items.push(chatForm);
+  const panel = chatOpen && activePanel();
+  if (panel) items.push(panel);
+  if (reminders.length) items.push(reminderBox);
+  if (permissions.length) items.push(permissionBox);
+  if (limitsBox.classList.contains("open")) items.push(limitsBox);
+  return items;
 }
 
 // The window covers the whole work area, so it must let clicks through
@@ -220,7 +392,10 @@ function render(now) {
 let passthrough = null;
 function updatePassthrough() {
   const c = pet.cursor;
-  const over = !!c && (pet.hitTest(c.x, c.y) || overChat(c.x, c.y));
+  const overBox = !!c && overChat(c.x, c.y);
+  // Aiming at a button: Clawd holds still for a moment instead of hopping around.
+  pet.uiHover = overBox;
+  const over = !!c && (pet.hitTest(c.x, c.y) || overBox);
   const want = !(over || pet.held);
   document.body.classList.toggle("over", over && !pet.held);
   document.body.classList.toggle("held", pet.held);
@@ -229,13 +404,13 @@ function updatePassthrough() {
   invoke("set_click_through", { enabled: want }).catch((e) => console.error(e));
 }
 
+// Whether the cursor is over one of the boxes, which must take clicks.
 function overChat(x, y) {
-  if (!chatOpen) return false;
   const inside = (el) => {
     const r = el.getBoundingClientRect();
     return r.width > 0 && x >= r.left - 4 && x <= r.right + 4 && y >= r.top - 4 && y <= r.bottom + 4;
   };
-  return inside(chatForm) || (pendingCommand !== null && inside(confirmBox));
+  return stack().some((el) => el !== limitsBox && inside(el));
 }
 
 function openChat() {
@@ -256,6 +431,7 @@ function openChat() {
 function closeChat() {
   if (!chatOpen) return;
   if (pendingCommand) cancelCommand();
+  hideOutput();
   chatOpen = false;
   chatForm.classList.remove("open");
   chatInput.blur();
@@ -302,6 +478,7 @@ function localIntent(message) {
   if (FORGET.test(message)) {
     invoke("forget_memory").catch(() => {});
     chatHistory = [];
+    fedFiles = [];
     say("forgot", true);
     return true;
   }
@@ -339,16 +516,18 @@ function saveRecent() {
 function askClawd(message) {
   chatInput.disabled = true;
   pet.awaitingReply = true;
-  sayText("…", true);
+  // Stays up until the answer replaces it (claude gives up after 90 s).
+  sayText("…", true, 90, "talk");
   const context = brain.describe(pet, nowSec());
-  invoke("claude_chat", { context, history: chatHistory, message })
+  if (fedFiles.length && nowSec() - fedAt > FED_FOR) fedFiles = [];
+  invoke("claude_chat", { context, history: chatHistory, message, files: fedFiles })
     .then((reply) => {
       if (!reply || (!reply.text && !reply.command)) throw new Error("empty reply");
       const note = reply.command ? `${reply.text} [offered to run: ${reply.command}]` : reply.text;
       chatHistory.push(["user", message], ["clawd", note]);
       chatHistory = chatHistory.slice(-16);
       saveRecent();
-      if (reply.text) sayText(reply.text, true);
+      if (reply.text) sayText(reply.text, true, 0, "talk");
       pet.hop(260);
       if (reply.remind) {
         setReminder(reply.remind.minutes, reply.remind.text).then((at) => {
@@ -384,8 +563,9 @@ chatForm.addEventListener("submit", (e) => {
 });
 
 function showConfirm(command) {
+  hideOutput();
   pendingCommand = command;
-  confirmCmd.textContent = command;
+  confirmCmd.replaceChildren(highlightCommand(command));
   confirmWarn.textContent = UI[lang].danger;
   confirmRun.textContent = UI[lang].run;
   confirmCancel.textContent = UI[lang].cancel;
@@ -404,9 +584,214 @@ function cancelCommand() {
   if (!pendingCommand) return;
   chatHistory.push(["user", `(declined to run: ${pendingCommand})`]);
   hideConfirm();
-  sayText(UI[lang].declined, true);
+  sayText(UI[lang].declined, true, 0, "talk");
   if (chatOpen) chatInput.focus();
 }
+
+// A terminal-style block like Claude Code shows: the command, what it printed, how it ended.
+// `result` is null while the command is still running.
+function showOutput(command, result) {
+  outputOpen = true;
+  outputCmd.replaceChildren(highlightCommand(command));
+  outputClose.title = UI[lang].close;
+  outputStatus.className = "";
+  if (!result) {
+    outputText.replaceChildren();
+    outputStatus.textContent = UI[lang].running;
+  } else {
+    outputText.replaceChildren(renderAnsi(result.output || ""));
+    outputText.scrollTop = outputText.scrollHeight;
+    const ok = !result.failed && !result.timed_out && result.code === 0;
+    outputStatus.className = ok ? "ok" : "fail";
+    outputStatus.textContent = result.failed
+      ? UI[lang].error
+      : result.timed_out
+        ? UI[lang].timeout
+        : ok
+          ? UI[lang].exit
+          : UI[lang].failed.replace("{code}", result.code ?? "?");
+  }
+  outputBox.classList.add("open");
+}
+
+function hideOutput() {
+  outputOpen = false;
+  outputBox.classList.remove("open");
+}
+
+// A card that stays until the user deals with it, while Clawd rings an alarm clock.
+function showReminder() {
+  const text = reminders[0];
+  if (text === undefined) return;
+  drawIcon(reminderIcon, "clock", Math.max(1, Math.round(2 * (window.devicePixelRatio || 1))));
+  reminderTitle.textContent = UI[lang].reminder;
+  reminderLine.textContent = text;
+  reminderDone.textContent = UI[lang].done;
+  reminderSnooze.textContent = UI[lang].snooze;
+  reminderBox.classList.remove("quiet");
+  reminderBox.classList.add("open");
+  pet.remind(text, nowSec());
+  // After a few minutes the card stops pulsing but stays.
+  const shown = text;
+  setTimeout(() => reminders[0] === shown && reminderBox.classList.add("quiet"), 180000);
+}
+
+// "Done", or a click on Clawd; with `snooze` the same reminder comes back in 5 minutes.
+function finishReminder(snooze) {
+  const text = reminders.shift();
+  if (text === undefined) return;
+  pet.ackReminder(nowSec());
+  if (snooze) {
+    setReminder(5, text);
+    say("remind_snoozed", true);
+  }
+  reminderBox.classList.remove("open");
+  if (reminders.length) showReminder();
+}
+
+// Claude Code wants to use a tool: Allow / Deny on a card, answered back through Rust.
+// Unanswered questions time out there and Claude Code asks in its own window instead.
+function showPermission() {
+  const ask = permissions[0];
+  if (!ask) return;
+  const ui = UI[lang];
+  const shell = ask.tool === "Bash" || ask.tool === "PowerShell";
+  const danger = shell && DANGER.test(ask.detail);
+  drawIcon(permissionIcon, "lock", Math.max(1, Math.round(2 * (window.devicePixelRatio || 1))));
+  permissionTitle.textContent = danger ? `${ui.careful}!` : ui.permission;
+  const wants = ui.wants[ask.tool] || ui.wantsOther.replace("{tool}", ask.tool);
+  const where = ask.project ? ` ${ui.in.replace("{project}", ask.project)}` : "";
+  permissionWhat.textContent = `Claude ${wants}${where}${ask.description ? `: ${ask.description}` : ""}`;
+  if (shell) permissionCmd.replaceChildren(highlightCommand(ask.detail));
+  else permissionCmd.textContent = ask.detail;
+  permissionAllow.textContent = ui.allow;
+  permissionDeny.textContent = ui.deny;
+  permissionBox.classList.toggle("danger", danger);
+  // For a risky command the highlighted, easy-to-hit button is "Deny".
+  permissionAllow.classList.toggle("primary", !danger);
+  permissionDeny.classList.toggle("primary", danger);
+  permissionBox.classList.add("open");
+  pet.waveUntil = nowSec() + 2.5;
+  pet.hop(420);
+  say("permission_ask", true);
+}
+
+function closePermission(id) {
+  const index = permissions.findIndex((p) => p.id === id);
+  if (index < 0) return false;
+  permissions.splice(index, 1);
+  permissionBox.classList.remove("open");
+  if (permissions.length) showPermission();
+  return true;
+}
+
+function answerPermission(allow) {
+  const ask = permissions[0];
+  if (!ask) return;
+  invoke("answer_permission", { id: ask.id, allow }).catch(() => {});
+  closePermission(ask.id);
+  say(allow ? "permission_allowed" : "permission_denied", true);
+}
+
+permissionAllow.addEventListener("click", () => answerPermission(true));
+permissionDeny.addEventListener("click", () => answerPermission(false));
+
+// The usage bar: one cell per 5%, each cell exactly one of Clawd's pixels.
+const LIMIT_CELLS = 20;
+function drawLimitBar(canvas, used) {
+  const s = cell || 5;
+  const w = LIMIT_CELLS + 2;
+  const h = 4;
+  canvas.width = w * s;
+  canvas.height = h * s;
+  canvas.style.width = `${canvas.width / (dpr || 1)}px`;
+  canvas.style.height = `${canvas.height / (dpr || 1)}px`;
+  const ctx = canvas.getContext("2d");
+  const fill = used >= 85 ? "#e04848" : used >= 60 ? "#f2c230" : "#7fd38a";
+  const filled = Math.round(Math.min(100, Math.max(0, used)) / (100 / LIMIT_CELLS));
+  ctx.fillStyle = "#3a2a22";
+  ctx.fillRect(s, 0, (w - 2) * s, s);
+  ctx.fillRect(s, (h - 1) * s, (w - 2) * s, s);
+  ctx.fillRect(0, s, s, (h - 2) * s);
+  ctx.fillRect((w - 1) * s, s, s, (h - 2) * s);
+  ctx.fillStyle = "#efe6d6";
+  ctx.fillRect(s, s, LIMIT_CELLS * s, (h - 2) * s);
+  ctx.fillStyle = fill;
+  ctx.fillRect(s, s, filled * s, (h - 2) * s);
+}
+
+function renderLimits() {
+  const ui = UI[lang];
+  const time = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const day = (unix) => new Date(unix * 1000).toLocaleDateString([], { weekday: "short" });
+  const rows = [
+    [ui.fiveHour, limits.five_hour, (w) => time(w.resets_at)],
+    [ui.week, limits.seven_day, (w) => `${day(w.resets_at)} ${time(w.resets_at)}`],
+  ].filter(([, w]) => w);
+  limitsBox.replaceChildren(
+    ...rows.map(([label, w, reset]) => {
+      const row = document.createElement("div");
+      row.className = "limit-row";
+      const name = document.createElement("span");
+      name.className = "limit-label";
+      name.textContent = label;
+      const bar = document.createElement("canvas");
+      drawLimitBar(bar, w.used);
+      const pct = document.createElement("span");
+      pct.textContent = `${Math.round(w.used)}%`;
+      const when = document.createElement("span");
+      when.className = "limit-reset";
+      when.textContent = w.resets_at ? `↻ ${reset(w)}` : "";
+      row.append(name, bar, pct, when);
+      return row;
+    }),
+  );
+}
+
+// Shows the limit bubble for a few seconds (if Claude Code has reported limits yet).
+function showLimits(seconds) {
+  if (!limits || (!limits.five_hour && !limits.seven_day)) return;
+  if (!limitsBox.classList.contains("open")) renderLimits();
+  limitsBox.classList.add("open");
+  limitsUntil = Math.max(limitsUntil, nowSec() + seconds);
+}
+
+reminderDone.addEventListener("click", () => finishReminder(false));
+reminderSnooze.addEventListener("click", () => finishReminder(true));
+
+// A short two-tone "ding-ding". The system notification has its own sound too,
+// in case the webview doesn't let a page play audio on its own.
+let audio = null;
+function chime() {
+  try {
+    audio ||= new AudioContext();
+    if (audio.state === "suspended") audio.resume();
+    const t0 = audio.currentTime + 0.02;
+    [988, 1319, 988, 1319].forEach((freq, i) => {
+      const at = t0 + i * 0.17;
+      const osc = audio.createOscillator();
+      const gain = audio.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, at);
+      gain.gain.exponentialRampToValueAtTime(0.2, at + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, at + 0.15);
+      osc.connect(gain).connect(audio.destination);
+      osc.start(at);
+      osc.stop(at + 0.16);
+    });
+  } catch {
+    // No audio: the card, the alarm clock and the notification still get attention.
+  }
+}
+
+outputClose.addEventListener("click", () => {
+  hideOutput();
+  if (chatOpen && !chatInput.disabled) chatInput.focus();
+});
+outputBox.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") hideOutput();
+});
 
 confirmCancel.addEventListener("click", cancelCommand);
 confirmRun.addEventListener("click", () => {
@@ -415,9 +800,11 @@ confirmRun.addEventListener("click", () => {
   hideConfirm();
   chatInput.disabled = true;
   pet.awaitingReply = true;
-  sayText(UI[lang].running, true);
+  sayText(UI[lang].running, true, 35, "talk");
+  showOutput(command, null);
   invoke("run_command", { command })
     .then((result) => {
+      showOutput(command, result);
       const status = result.timed_out ? "it timed out after 30 s" : `exit code ${result.code}`;
       const output = result.output || "(no output)";
       askClawd(
@@ -428,7 +815,8 @@ confirmRun.addEventListener("click", () => {
     .catch((e) => {
       pet.awaitingReply = false;
       chatInput.disabled = false;
-      sayText(String(e), true);
+      showOutput(command, { output: String(e), failed: true });
+      if (chatOpen) chatInput.focus();
     });
 });
 confirmBox.addEventListener("keydown", (e) => {
@@ -476,14 +864,84 @@ listen("recall", () => {
   setTimeout(refreshLayout, 300);
 });
 listen("platform", ({ payload }) => pet.setPlatform(payload, nowSec()));
-listen("remind", ({ payload }) => pet.remind(payload.text, nowSec()));
+listen("remind", ({ payload }) => {
+  reminders.push(payload.text || phrase("remind_default"));
+  if (reminders.length === 1) showReminder();
+});
 listen("feed", () => pet.feed(nowSec()));
 listen("memory_cleared", () => {
   chatHistory = [];
+  fedFiles = [];
+});
+
+// Dragging files onto Clawd feeds them to him. The overlay only takes the drop while
+// the cursor is over him or one of his boxes (elsewhere it lets the mouse through).
+const dropPoint = (position) => {
+  const scale = window.devicePixelRatio || 1;
+  return { x: position.x / scale, y: position.y / scale };
+};
+const overPet = ({ x, y }) => {
+  const pad = pet.w * 0.4;
+  return x >= pet.x - pad && x <= pet.x + pet.w + pad && y >= pet.y - pad && y <= pet.y + pet.h + pad;
+};
+let dragTeased = false;
+listen("tauri://drag-enter", () => {
+  dragTeased = false;
+});
+listen("tauri://drag-over", ({ payload }) => {
+  if (!payload?.position || !overPet(dropPoint(payload.position))) return;
+  pet.expectFood(nowSec());
+  if (!dragTeased) {
+    dragTeased = true;
+    say("file_drag", true);
+  }
+});
+listen("tauri://drag-leave", () => {
+  dragTeased = false;
+});
+listen("tauri://drag-drop", ({ payload }) => {
+  const paths = (payload?.paths || []).slice(0, MAX_FED);
+  if (!paths.length) return;
+  pet.eatFile(nowSec());
+  const failed = (path) => ({ name: path.split(/[\\/]/).pop(), kind: "error" });
+  Promise.all(paths.map((path) => invoke("feed_file", { path }).then((f) => f || failed(path), () => failed(path))))
+    .then((files) => {
+      const good = files.filter((f) => f && f.kind !== "error");
+      fedFiles = [...fedFiles.filter((f) => !good.some((g) => g.path === f.path)), ...good].slice(-MAX_FED);
+      fedAt = nowSec();
+      const last = files[files.length - 1];
+      const name = files.length > 1 ? files.map((f) => f.name).join(", ") : last.name;
+      const phrase = { error: "file_error", binary: "file_binary", folder: "file_folder" }[last.kind] || "file_eaten";
+      say(phrase, true, { name });
+      if (good.length) openChat();
+    });
 });
 listen("chat_open", () => openChat());
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
-listen("claude", ({ payload }) => pet.onClaude(payload, nowSec()));
+listen("claude", ({ payload }) => {
+  const now = nowSec();
+  switch (payload.kind) {
+    case "permission":
+      permissions.push(payload);
+      if (permissions.length === 1) showPermission();
+      return;
+    case "permission_done":
+      if (closePermission(payload.id)) say("permission_timeout", true);
+      return;
+    case "limits": {
+      limits = payload;
+      if (limitsBox.classList.contains("open")) renderLimits();
+      if (pet.onLimits(payload, now)) showLimits(8);
+      return;
+    }
+    case "stop":
+      pet.onClaude(payload, now);
+      showLimits(6);
+      return;
+    default:
+      pet.onClaude(payload, now);
+  }
+});
 listen("notice", ({ payload }) => {
   if (payload.phrase === "claude_found") brain.forget();
   if (payload.phrase === "forgot") chatHistory = [];
@@ -524,6 +982,12 @@ function tick(ms) {
     refreshLayout();
   }
   fitCanvas();
+  // Resting the cursor on Clawd shows how much of the Claude limit is left.
+  if (pet.hoverSince && now - pet.hoverSince > 0.8) showLimits(2.5);
+  if (limitsUntil && now > limitsUntil) {
+    limitsUntil = 0;
+    limitsBox.classList.remove("open");
+  }
   const caughtUp = areaHold && Math.abs(window.innerWidth - areaHold.width) < 2;
   if (areaHold && (caughtUp || now > areaHold.until)) areaHold = null;
   if (areaHold) pet.setArea(areaHold.width, areaHold.height);
