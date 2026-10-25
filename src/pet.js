@@ -158,6 +158,8 @@ export class Pet {
     this.limitWarned = new Map();
     // The cursor is over a box above Clawd (chat, reminder card).
     this.uiHover = false;
+    // Claude plan usage from the status line, when Claude Code has sent it.
+    this.limits = null;
   }
 
   setUnit(unit) {

@@ -216,6 +216,8 @@ const TALK = new Set([
   "pomodoro_set",
   "reminders_cleared",
   "forgot",
+  "limits_here",
+  "limits_unknown",
 ]);
 let bubblePriority = 0;
 // An event that came while the user was reading an answer; shown right after it.
@@ -460,6 +462,7 @@ const REMIND_IN = /(?:напомни|remind)\S*\s+(?:мне\s+|me\s+)?(?:чер�
 const REMIND_AT = /(?:напомни|remind)\S*\s+(?:мне\s+|me\s+)?(?:в|at)\s+(\d{1,2})[:.](\d{2})\s*/i;
 const POMODORO = /помодор|pomodoro/i;
 const CANCEL = /(отмен|сбрось|удали|убери)\S*\s.{0,20}напомин|(cancel|clear|delete)\s.{0,20}remind/i;
+const LIMITS = /лимит|limit|usage|сколько.{0,20}(осталось|токен)|квот/i;
 const FORGET = /^\s*(забудь\s+(всё|все|наш\S* разговор\S*)|forget\s+(everything|our\s+chats?))/i;
 
 function reminderText(message, match) {
@@ -473,6 +476,16 @@ function localIntent(message) {
   if (CANCEL.test(message)) {
     invoke("clear_reminders").catch(() => {});
     say("reminders_cleared", true);
+    return true;
+  }
+  // Usage limits are known only from Claude Code's status line; answer from that, no Haiku.
+  if (LIMITS.test(message) && !/напомн|remind/i.test(message)) {
+    if (limits && (limits.five_hour || limits.seven_day)) {
+      showLimits(10);
+      say("limits_here", true);
+    } else {
+      say("limits_unknown", true);
+    }
     return true;
   }
   if (FORGET.test(message)) {
@@ -930,6 +943,7 @@ listen("claude", ({ payload }) => {
       return;
     case "limits": {
       limits = payload;
+      pet.limits = payload;
       if (limitsBox.classList.contains("open")) renderLimits();
       if (pet.onLimits(payload, now)) showLimits(8);
       return;

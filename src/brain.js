@@ -99,6 +99,12 @@ export class Brain {
     lines.push(`- Clawd feels ${feeling}${food < 25 ? " and is hungry" : ""}.`);
     const projects = [...pet.claudeSessions.values()].map((s) => s.project).filter(Boolean);
     if (projects.length) lines.push(`- Claude Code is working on a task in ${projects.join(", ")}.`);
+    const usage = pet.limits;
+    if (usage?.five_hour || usage?.seven_day) {
+      const part = (name, w) => (w ? `${name} ${Math.round(w.used)}% used` : null);
+      const parts = [part("5-hour window", usage.five_hour), part("weekly", usage.seven_day)].filter(Boolean);
+      lines.push(`- The user's Claude plan usage: ${parts.join(", ")}.`);
+    }
     if (extra) lines.push(`- ${extra}`);
     return lines.join("\n");
   }
