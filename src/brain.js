@@ -1,9 +1,10 @@
 // Clawd's "brain": what's going on around him, and a stash of lines from Claude Haiku.
 // The situation is described to Haiku in English; Rust tells it which language to answer in.
 
-const CACHE_TTL = 180;
-const REFILL_EVERY = 60;
-const WINDOW_COMMENT_EVERY = 60;
+const CACHE_TTL = 150;
+const REFILL_EVERY = 30;
+const CACHE_LOW = 4;
+const WINDOW_COMMENT_EVERY = 45;
 const APP_FORGET_AFTER = 15 * 60;
 
 const STATE_NAMES = {
@@ -78,7 +79,14 @@ export class Brain {
       const app = this.window.app ? ` (${this.window.app})` : "";
       lines.push(`- The user has this window open: "${this.window.title}"${app}.`);
     }
-    if (this.kpm > 0) lines.push(`- The user is typing, about ${this.kpm} key presses a minute.`);
+    if (this.kpm > 0) {
+      lines.push(`- The user is typing, about ${this.kpm} key presses a minute.`);
+    } else {
+      const idle = Math.round((now - pet.lastUserInput) / 60);
+      if (idle >= 3) {
+        lines.push(`- The user hasn't touched the mouse or keyboard for about ${idle} min; they seem away or idle.`);
+      }
+    }
     if (pet.music) lines.push("- Music is playing.");
     lines.push(`- Clawd is ${STATE_NAMES[pet.state] || "busy with his own things"}.`);
     const projects = [...pet.claudeSessions.values()].map((s) => s.project).filter(Boolean);
@@ -107,8 +115,8 @@ export class Brain {
 
   maybeRefill(pet, now) {
     this.cache = this.cache.filter((p) => now - p.at < CACHE_TTL);
-    const interval = this.available ? REFILL_EVERY : REFILL_EVERY * 5;
-    if (this.pending || this.cache.length >= 3 || now - this.lastRequest < interval) return;
+    const interval = this.available ? REFILL_EVERY : REFILL_EVERY * 6;
+    if (this.pending || this.cache.length >= CACHE_LOW || now - this.lastRequest < interval) return;
     this.ask(this.describe(pet, now), 8).then((lines) => {
       const at = performance.now() / 1000;
       this.cache.push(...lines.map((text) => ({ text, at })));

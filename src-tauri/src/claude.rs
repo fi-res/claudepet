@@ -347,7 +347,10 @@ pub fn phrases(output: &str, max_chars: usize) -> Vec<String> {
 pub fn idle_prompt(lang: Lang, context: &str, count: u32) -> String {
     format!(
         "What is going on right now:\n{context}\n\nWrite {count} different short lines (up to 40 characters) \
-         that Clawd could say right now, in {}. Teasing the situation a little is welcome. One per line.",
+         that Clawd could say right now, in {}. Most lines should react to the situation above (time \
+         of day, the open window, the music, whether the user is busy or idle). If the user seems away or idle, \
+         gently tease it (e.g. hint that you've been standing around doing nothing). Keep a couple of lines \
+         generic. Light, warm, geeky humour. One per line.",
         lang.name()
     )
 }

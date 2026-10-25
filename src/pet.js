@@ -4,6 +4,8 @@ import { GRID_W, GRID_H, SPINNER_LENGTH } from "./sprite.js";
 const GRAVITY = 2600;
 const WALK_SPEED = 42;
 const SLEEP_AFTER = 180;
+// How often Clawd says something of his own while idle.
+const CHATTER_EVERY = [18, 35];
 // Dozing off on his own lasts this long (minutes) at most.
 const DEEP_SLEEP = [20, 40];
 // Coming back to the computer after this long wakes him up.
@@ -70,6 +72,7 @@ export class Pet {
     this.typingPause = 0;
     this.napUntil = 0;
     this.lastUserInput = now;
+    this.nextChatter = now + rand(CHATTER_EVERY[0], CHATTER_EVERY[1]);
     this.music = false;
     this.musicReacted = false;
     this.phones = false;
@@ -301,6 +304,11 @@ export class Pet {
 
     const attention = this.attention(now);
     if (attention !== null) this.look = attention;
+
+    if (now >= this.nextChatter && now - this.lastInteraction > 5 && !this.hopActive && !this.walkIn) {
+      this.nextChatter = now + rand(CHATTER_EVERY[0], CHATTER_EVERY[1]);
+      this.fx.say("idle");
+    }
 
     const busy = this.music || this.claudeSessions.size > 0;
     if (now - this.lastInteraction > SLEEP_AFTER && !busy && !this.hopActive && !this.walkIn) {
