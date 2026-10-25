@@ -303,12 +303,17 @@ pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str, web: bool) -> R
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(prompt.as_bytes()).map_err(|e| e.to_string())?;
     }
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let reader = thread::spawn(move || {
-        let mut out = String::new();
-        let _ = stdout.read_to_string(&mut out);
-        out
-    });
+    // Both pipes are drained while the process runs: a chatty stderr would
+    // otherwise fill its buffer and stall claude until the timeout.
+    let read_all = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut out = String::new();
+            let _ = pipe.read_to_string(&mut out);
+            out
+        })
+    };
+    let stdout = read_all(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = read_all(Box::new(child.stderr.take().expect("stderr is piped")));
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -321,12 +326,9 @@ pub fn ask(cli: &Path, workdir: &Path, lang: Lang, prompt: &str, web: bool) -> R
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let out = reader.join().unwrap_or_default();
+    let out = stdout.join().unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
     if !status.success() {
-        let mut err = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut err);
-        }
         let reason = if err.trim().is_empty() { out.trim() } else { err.trim() };
         return Err(format!("claude failed: {reason}"));
     }
@@ -399,16 +401,26 @@ pub fn shell_name() -> &'static str {
 
 /// The prompt for a reply to something the user typed to Clawd in the chat box.
 /// `history` holds earlier turns as (speaker, text), speaker being "user" or "clawd".
-pub fn chat_prompt(lang: Lang, context: &str, history: &[[String; 2]], message: &str) -> String {
+pub fn chat_prompt(lang: Lang, context: &str, memory: &[String], history: &[[String; 2]], message: &str) -> String {
     let mut dialogue = String::new();
     for [who, text] in history.iter().rev().take(8).rev() {
         let who = if who == "user" { "User" } else { "Clawd" };
-        dialogue.push_str(&format!("{who}: {text}\n"));
+        // Old turns only need their gist; long ones would cost tokens on every message.
+        dialogue.push_str(&format!("{who}: {}\n", clip_chars(text, 240)));
     }
+    let remembered = if memory.is_empty() {
+        String::new()
+    } else {
+        format!("What you remember about the user from earlier chats: {}\n\n", memory.join("; "))
+    };
     format!(
-        "What is going on right now:\n{context}\n\nConversation so far:\n{dialogue}User: {message}\n\n\
+        "What is going on right now:\n{context}\n\n{remembered}Conversation so far:\n{dialogue}User: {message}\n\n\
          Answer the user as Clawd, in {lang}, in one or two short sentences (under 200 characters), staying \
          in character. Plain text only, no markdown or links. You may search the web if it helps.\n\n\
+         If the user asks to be reminded of something later, add a line: REMIND: <minutes from now> | <short \
+         reminder text in {lang}>. If the user tells you a lasting fact worth remembering in future chats \
+         (their name, preferences, what they work on), add a line: MEMORY: <the fact in a few English words>. \
+         Use each at most once and only when it really applies.\n\n\
          You can also offer to run ONE shell command on the user's computer ({shell}). The user sees it and \
          must confirm before it runs. To offer one, put it alone on the last line as: COMMAND: <command>\n\
          Rules for commands: only when the user asks for something on their computer; prefer read-only \
@@ -421,11 +433,38 @@ pub fn chat_prompt(lang: Lang, context: &str, history: &[[String; 2]], message: 
     )
 }
 
-/// A chat answer: what Clawd says, and a shell command he offers to run, if any.
+fn clip_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text.to_string(),
+    }
+}
+
+/// A reminder Haiku set from the chat: in how many minutes, and what to say.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Remind {
+    pub minutes: f64,
+    pub text: String,
+}
+
+/// A chat answer: what Clawd says, and a shell command he offers to run, if any,
+/// plus a reminder to set and a fact to remember, when the user asked for those.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ChatReply {
     pub text: String,
     pub command: Option<String>,
+    pub remind: Option<Remind>,
+    pub memory: Option<String>,
+}
+
+fn parse_remind(spec: &str) -> Option<Remind> {
+    let (minutes, text) = spec.split_once('|').unwrap_or((spec, ""));
+    let minutes: f64 = minutes.trim().trim_end_matches(|c: char| c.is_alphabetic()).trim().parse().ok()?;
+    // Up to a week ahead; anything else is a misunderstanding.
+    if !(0.05..=7.0 * 24.0 * 60.0).contains(&minutes) {
+        return None;
+    }
+    Some(Remind { minutes, text: clip_chars(text.trim(), 120) })
 }
 
 /// Turns markdown into plain text for the bubble: drops emphasis marks and keeps link text.
@@ -465,19 +504,26 @@ pub fn reply(output: &str, max_chars: usize) -> Option<String> {
 /// Splits Haiku's chat output into the spoken reply and an offered `COMMAND:` line.
 pub fn parse_chat(output: &str, max_chars: usize) -> Option<ChatReply> {
     let mut command = None;
+    let mut remind = None;
+    let mut memory = None;
     let mut spoken = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim().trim_matches('`').trim();
-        match trimmed.strip_prefix("COMMAND:") {
-            Some(cmd) if !cmd.trim().is_empty() => command = Some(cmd.trim().to_string()),
-            _ => spoken.push(line),
+        if let Some(cmd) = trimmed.strip_prefix("COMMAND:").map(str::trim).filter(|c| !c.is_empty()) {
+            command = Some(cmd.to_string());
+        } else if let Some(spec) = trimmed.strip_prefix("REMIND:") {
+            remind = parse_remind(spec).or(remind);
+        } else if let Some(fact) = trimmed.strip_prefix("MEMORY:").map(str::trim).filter(|f| !f.is_empty()) {
+            memory = Some(clip_chars(fact, 80));
+        } else {
+            spoken.push(line);
         }
     }
     let text = reply(&spoken.join("\n"), max_chars);
-    match (text, command) {
-        (None, None) => None,
-        (text, command) => Some(ChatReply { text: text.unwrap_or_default(), command }),
+    if text.is_none() && command.is_none() && remind.is_none() {
+        return None;
     }
+    Some(ChatReply { text: text.unwrap_or_default(), command, remind, memory })
 }
 
 #[cfg(test)]
@@ -507,6 +553,8 @@ mod tests {
             Some(ChatReply {
                 text: "Сейчас посмотрю, кто ест память.".into(),
                 command: Some("ps -eo pid,comm,%mem --sort=-%mem | head -5".into()),
+                remind: None,
+                memory: None,
             })
         );
         let plain = parse_chat("**Rust 1.99** вышел, см. [блог](https://blog.rust-lang.org)", 200).unwrap();
@@ -518,7 +566,23 @@ mod tests {
     #[test]
     fn chat_prompt_keeps_recent_turns() {
         let history: Vec<[String; 2]> = (0..12).map(|i| ["user".into(), format!("m{i}")]).collect();
-        let prompt = chat_prompt(Lang::En, "- ctx", &history, "hi");
+        let prompt = chat_prompt(Lang::En, "- ctx", &[], &history, "hi");
         assert!(!prompt.contains("User: m3\n") && prompt.contains("User: m4\n") && prompt.contains("User: hi"));
+        assert!(!prompt.contains("remember about the user"));
+        let prompt = chat_prompt(Lang::En, "- ctx", &["name is Max".into()], &history, "hi");
+        assert!(prompt.contains("from earlier chats: name is Max"));
+    }
+
+    #[test]
+    fn chat_output_carries_reminders_and_memories() {
+        let out = "Хорошо, напомню!\nREMIND: 25 | Перерыв\nMEMORY: user is called Max\n";
+        let reply = parse_chat(out, 200).unwrap();
+        assert_eq!(reply.text, "Хорошо, напомню!");
+        assert_eq!(reply.remind, Some(Remind { minutes: 25.0, text: "Перерыв".into() }));
+        assert_eq!(reply.memory.as_deref(), Some("user is called Max"));
+        assert_eq!(parse_chat("Ок\nREMIND: 10 min | Чай", 200).unwrap().remind.unwrap().minutes, 10.0);
+        // Nonsense times are dropped instead of setting a reminder for a year from now.
+        assert_eq!(parse_chat("Ок\nREMIND: 999999 | x", 200).unwrap().remind, None);
+        assert_eq!(parse_chat("Ок\nREMIND: soon", 200).unwrap().remind, None);
     }
 }

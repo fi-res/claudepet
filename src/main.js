@@ -5,6 +5,11 @@ import { Brain } from "./brain.js";
 
 const UNIT = 5;
 const MAX_PARTICLES = 14;
+const VITALS_SAVE_EVERY = 60;
+const LAYOUT_EVERY = 5;
+// While Clawd's computer is off he gets hungry slower, and never starves.
+const OFFLINE_FOOD_DECAY = 3;
+const OFFLINE_FOOD_FLOOR = 15;
 
 // Running outside Tauri (plain browser) is handy for debugging the pet itself.
 const tauri = window.__TAURI__;
@@ -51,7 +56,31 @@ const pet = new Pet(UNIT, {
   sayText,
   spawn,
   hideBubble,
+  cross: crossEdge,
 });
+
+// In a plain browser, expose the pet for poking at from the dev console.
+if (!tauri) window.clawd = pet;
+
+// After a move to another monitor the page may report the old size for a frame
+// or two; use the size Rust gave us until it catches up.
+let areaHold = null;
+
+function crossEdge(side, y) {
+  invoke("cross_edge", { side, y })
+    .then((layout) => {
+      if (!layout) return pet.crossFailed(side);
+      areaHold = { width: layout.width, height: layout.height, until: nowSec() + 1.5 };
+      pet.arrive(side, layout, nowSec());
+    })
+    .catch(() => pet.crossFailed(side));
+}
+
+function refreshLayout() {
+  invoke("monitor_layout")
+    .then((layout) => layout && pet.setEdges(layout))
+    .catch(() => {});
+}
 
 function fitCanvas() {
   if (window.devicePixelRatio === dpr) return;
@@ -89,14 +118,20 @@ function say(category, force = false, vars = {}) {
 }
 
 // Forced lines (Claude's thoughts, reports) aren't talked over by idle chatter.
-function sayText(text, force = false) {
+// `hold` keeps the bubble up for at least that many seconds.
+function sayText(text, force = false, hold = 0) {
   const now = nowSec();
   if (!force && bubbleImportant && now < bubbleUntil) return;
   lastPhrase = text;
   bubbleImportant = force;
   bubble.textContent = text;
   bubble.classList.add("visible");
-  bubbleUntil = now + 3.5 + text.length * 0.08;
+  bubbleUntil = now + Math.max(hold, 3.5 + text.length * 0.08);
+}
+
+// One line from a category, for text that's stored rather than spoken right away.
+function phrase(category) {
+  return pick(PHRASES[lang][category] || [category]);
 }
 
 function hideBubble() {
@@ -227,6 +262,79 @@ function closeChat() {
   pet.endChat();
 }
 
+// What to say when the chat call fails, by what went wrong.
+function chatErrorPhrase(error) {
+  const text = String(error);
+  if (/\bdisabled\b/.test(text)) return "chat_error_disabled";
+  if (/not found/i.test(text)) return "chat_error_missing";
+  if (/authenticat|log ?in|oauth|credential|unauthori|401/i.test(text)) return "chat_error_auth";
+  if (/timed out/i.test(text)) return "chat_error_timeout";
+  if (/rate.?limit|usage limit|limit reached|429/i.test(text)) return "chat_error_limit";
+  return "chat_error";
+}
+
+const clockTime = (unix) => new Date(unix * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+function setReminder(minutes, text) {
+  return invoke("add_reminder", { minutes, text: text || phrase("remind_default") }).then((at) => at || 0);
+}
+
+const UNITS = { s: 1 / 60, m: 1, h: 60 };
+const REMIND_IN = /(?:напомни|remind)\S*\s+(?:мне\s+|me\s+)?(?:через|in)\s+(\d+(?:[.,]\d+)?)\s*(сек\S*|с|sec\S*|s\b|мин\S*|м|min\S*|m\b|час\S*|ч|hour\S*|h\b)\s*/i;
+const REMIND_AT = /(?:напомни|remind)\S*\s+(?:мне\s+|me\s+)?(?:в|at)\s+(\d{1,2})[:.](\d{2})\s*/i;
+const POMODORO = /помодор|pomodoro/i;
+const CANCEL = /(отмен|сбрось|удали|убери)\S*\s.{0,20}напомин|(cancel|clear|delete)\s.{0,20}remind/i;
+const FORGET = /^\s*(забудь\s+(всё|все|наш\S* разговор\S*)|forget\s+(everything|our\s+chats?))/i;
+
+function reminderText(message, match) {
+  const rest = message.replace(match[0], " ").replace(/^\s*(напомни\S*|remind)\s*(мне|me)?/i, "");
+  return rest.replace(/^\s*(о том,? что|что|чтобы|про|о|to|about|that)\s+/i, "").replace(/^[\s,.:;—-]+|[\s.!]+$/g, "");
+}
+
+// Reminders, pomodoro and "forget everything" are handled here without asking
+// Haiku, so they work offline and cost no tokens. Returns true when handled.
+function localIntent(message) {
+  if (CANCEL.test(message)) {
+    invoke("clear_reminders").catch(() => {});
+    say("reminders_cleared", true);
+    return true;
+  }
+  if (FORGET.test(message)) {
+    invoke("forget_memory").catch(() => {});
+    chatHistory = [];
+    say("forgot", true);
+    return true;
+  }
+  if (POMODORO.test(message)) {
+    setReminder(25, phrase("pomodoro_break"));
+    setReminder(30, phrase("pomodoro_back"));
+    say("pomodoro_set", true);
+    return true;
+  }
+  const inMatch = message.match(REMIND_IN);
+  if (inMatch) {
+    const amount = parseFloat(inMatch[1].replace(",", "."));
+    const unit = inMatch[2].toLowerCase();
+    const scale = /^(с|s)/.test(unit) ? UNITS.s : /^(ч|h)/.test(unit) ? UNITS.h : UNITS.m;
+    setReminder(amount * scale, reminderText(message, inMatch)).then((at) => say("remind_set", true, { time: clockTime(at) }));
+    return true;
+  }
+  const atMatch = message.match(REMIND_AT);
+  if (atMatch) {
+    const target = new Date();
+    target.setHours(+atMatch[1], +atMatch[2], 0, 0);
+    if (target <= new Date()) target.setDate(target.getDate() + 1);
+    const minutes = (target - new Date()) / 60000;
+    setReminder(minutes, reminderText(message, atMatch)).then((at) => say("remind_set", true, { time: clockTime(at) }));
+    return true;
+  }
+  return false;
+}
+
+function saveRecent() {
+  invoke("save_recent", { recent: chatHistory.slice(-6) }).catch(() => {});
+}
+
 // Sends a message to Haiku; the answer is spoken and may offer a command to confirm.
 function askClawd(message) {
   chatInput.disabled = true;
@@ -239,11 +347,21 @@ function askClawd(message) {
       const note = reply.command ? `${reply.text} [offered to run: ${reply.command}]` : reply.text;
       chatHistory.push(["user", message], ["clawd", note]);
       chatHistory = chatHistory.slice(-16);
+      saveRecent();
       if (reply.text) sayText(reply.text, true);
       pet.hop(260);
+      if (reply.remind) {
+        setReminder(reply.remind.minutes, reply.remind.text).then((at) => {
+          if (!reply.text) say("remind_set", true, { time: clockTime(at) });
+        });
+      }
+      if (reply.memory) {
+        invoke("remember", { fact: reply.memory }).catch(() => {});
+        spawn("spark");
+      }
       if (reply.command) showConfirm(reply.command);
     })
-    .catch(() => say("chat_error", true))
+    .catch((e) => say(chatErrorPhrase(e), true))
     .finally(() => {
       pet.awaitingReply = false;
       chatInput.disabled = false;
@@ -257,6 +375,11 @@ chatForm.addEventListener("submit", (e) => {
   if (!message) return closeChat();
   if (chatInput.disabled || pendingCommand) return;
   chatInput.value = "";
+  pet.cheer(3);
+  if (localIntent(message)) {
+    pet.hop(260);
+    return;
+  }
   askClawd(message);
 });
 
@@ -348,12 +471,22 @@ listen("cursor", ({ payload }) => {
   pet.setCursor(payload.x, payload.y, nowSec());
   updatePassthrough();
 });
-listen("recall", () => pet.recall(nowSec()));
+listen("recall", () => {
+  pet.recall(nowSec());
+  setTimeout(refreshLayout, 300);
+});
+listen("platform", ({ payload }) => pet.setPlatform(payload, nowSec()));
+listen("remind", ({ payload }) => pet.remind(payload.text, nowSec()));
+listen("feed", () => pet.feed(nowSec()));
+listen("memory_cleared", () => {
+  chatHistory = [];
+});
 listen("chat_open", () => openChat());
 listen("audio", ({ payload }) => pet.onAudio(payload, nowSec()));
 listen("claude", ({ payload }) => pet.onClaude(payload, nowSec()));
 listen("notice", ({ payload }) => {
   if (payload.phrase === "claude_found") brain.forget();
+  if (payload.phrase === "forgot") chatHistory = [];
   say(payload.phrase, true);
 });
 listen("language", ({ payload }) => {
@@ -373,24 +506,62 @@ listen("context", ({ payload }) => {
 });
 
 let nextRefill = 0;
+let nextVitalsSave = VITALS_SAVE_EVERY;
+let nextLayout = LAYOUT_EVERY;
 
 function tick(ms) {
-  if (ms / 1000 >= nextRefill) {
-    nextRefill = ms / 1000 + 1;
-    brain.maybeRefill(pet, ms / 1000);
+  const now = ms / 1000;
+  if (now >= nextRefill) {
+    nextRefill = now + 1;
+    brain.maybeRefill(pet, now);
+  }
+  if (now >= nextVitalsSave) {
+    nextVitalsSave = now + VITALS_SAVE_EVERY;
+    invoke("save_vitals", pet.vitals).catch(() => {});
+  }
+  if (now >= nextLayout) {
+    nextLayout = now + LAYOUT_EVERY;
+    refreshLayout();
   }
   fitCanvas();
-  pet.setArea(window.innerWidth, window.innerHeight);
+  const caughtUp = areaHold && Math.abs(window.innerWidth - areaHold.width) < 2;
+  if (areaHold && (caughtUp || now > areaHold.until)) areaHold = null;
+  if (areaHold) pet.setArea(areaHold.width, areaHold.height);
+  else pet.setArea(window.innerWidth, window.innerHeight);
   pet.step(ms / 1000);
   render(ms / 1000);
   updatePassthrough();
   requestAnimationFrame(tick);
 }
 
+// Mood and fullness from last time, minus what wore off while Clawd was closed.
+function loadVitals() {
+  return invoke("get_vitals")
+    .then((saved) => {
+      if (!saved) return;
+      const hours = Math.max(0, Date.now() / 1000 - saved.at) / 3600;
+      const food = Math.max(Math.min(saved.food, OFFLINE_FOOD_FLOOR), saved.food - hours * OFFLINE_FOOD_DECAY);
+      pet.setVitals({ mood: Math.max(40, saved.mood - hours), food });
+    })
+    .catch(() => {})
+    .finally(() => invoke("save_vitals", pet.vitals).catch(() => {}));
+}
+
+function loadMemory() {
+  return invoke("get_memory")
+    .then((memory) => {
+      if (memory && Array.isArray(memory.recent)) chatHistory = memory.recent;
+    })
+    .catch(() => {});
+}
+
 // Clawd greets on his first frame, so learn the saved language before starting.
 const timeout = new Promise((resolve) => setTimeout(resolve, 500));
-Promise.race([invoke("get_language").catch(() => null), timeout]).then((value) => {
+const ready = Promise.all([invoke("get_language").catch(() => null), loadVitals(), loadMemory()]);
+Promise.race([ready, timeout]).then((values) => {
+  const value = values && values[0];
   if (value) lang = value;
   fitCanvas();
+  refreshLayout();
   requestAnimationFrame(tick);
 });

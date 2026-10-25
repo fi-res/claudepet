@@ -25,6 +25,9 @@ pub enum ContextEvent {
     Window { app: String, title: String },
     /// Key presses per minute over the last few seconds.
     Typing { kpm: u32 },
+    /// The focused window's frame in physical screen pixels (left, top, right,
+    /// bottom), or None when there's nothing to stand on (maximized, desktop...).
+    Frame { rect: Option<[i32; 4]> },
 }
 
 type KeyBits = [u8; 32];
@@ -57,6 +60,7 @@ pub fn spawn(enabled: Arc<AtomicBool>, mut emit: impl FnMut(ContextEvent) + Send
         let mut presses: VecDeque<(Instant, u32)> = VecDeque::new();
         let mut last_typing = Instant::now();
         let mut last_kpm = 0;
+        let mut last_frame: Option<Option<[i32; 4]>> = None;
         let mut tick = 0u32;
         while enabled.load(Ordering::Relaxed) {
             thread::sleep(POLL);
@@ -78,6 +82,14 @@ pub fn spawn(enabled: Arc<AtomicBool>, mut emit: impl FnMut(ContextEvent) + Send
                 if kpm != last_kpm {
                     last_kpm = kpm;
                     emit(ContextEvent::Typing { kpm });
+                }
+            }
+
+            // The frame is polled every tick so Clawd rides along when the window is dragged.
+            if let Some(frame) = probe.frame() {
+                if last_frame != Some(frame) {
+                    last_frame = Some(frame);
+                    emit(ContextEvent::Frame { rect: frame });
                 }
             }
 
@@ -165,6 +177,11 @@ mod platform {
             Some((app, String::from_utf8_lossy(&title).into_owned()))
         }
 
+        /// Not tracked on X11 yet: Clawd only stands on the panel there.
+        pub fn frame(&self) -> Option<Option<[i32; 4]>> {
+            None
+        }
+
         pub fn keys(&self) -> KeyBits {
             self.conn
                 .query_keymap()
@@ -179,18 +196,25 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::KeyBits;
-    use std::path::Path;
+    use std::{ffi::c_void, path::Path};
     use windows::{
         core::PWSTR,
         Win32::{
-            Foundation::CloseHandle,
+            Foundation::{CloseHandle, RECT},
+            Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS},
             System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION},
             UI::{
                 Input::KeyboardAndMouse::GetAsyncKeyState,
-                WindowsAndMessaging::{GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId},
+                WindowsAndMessaging::{
+                    GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+                    IsIconic, IsWindowVisible, IsZoomed,
+                },
             },
         },
     };
+
+    /// The desktop and the taskbar are focusable but nothing to stand on.
+    const SHELL_CLASSES: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
 
     pub struct Probe;
 
@@ -227,6 +251,45 @@ mod platform {
             }
         }
 
+        /// None when the focused window is Clawd's own overlay: clicking him
+        /// shouldn't knock him off the window he's sitting on.
+        pub fn frame(&self) -> Option<Option<[i32; 4]>> {
+            unsafe {
+                let hwnd = GetForegroundWindow();
+                if hwnd.is_invalid() {
+                    return Some(None);
+                }
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid == std::process::id() {
+                    return None;
+                }
+                if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
+                    return Some(None);
+                }
+                let mut class = [0u16; 64];
+                let len = GetClassNameW(hwnd, &mut class).max(0) as usize;
+                if SHELL_CLASSES.contains(&String::from_utf16_lossy(&class[..len]).as_str()) {
+                    return Some(None);
+                }
+                // The DWM frame excludes the invisible resize borders GetWindowRect includes.
+                let mut r = RECT::default();
+                let dwm = DwmGetWindowAttribute(
+                    hwnd,
+                    DWMWA_EXTENDED_FRAME_BOUNDS,
+                    &mut r as *mut RECT as *mut c_void,
+                    std::mem::size_of::<RECT>() as u32,
+                );
+                if dwm.is_err() && GetWindowRect(hwnd, &mut r).is_err() {
+                    return Some(None);
+                }
+                if r.right - r.left < 160 || r.bottom - r.top < 80 {
+                    return Some(None);
+                }
+                Some(Some([r.left, r.top, r.right, r.bottom]))
+            }
+        }
+
         pub fn keys(&self) -> KeyBits {
             let mut bits = [0u8; 32];
             // 0x08.. skips the mouse buttons.
@@ -251,6 +314,9 @@ mod platform {
             None
         }
         pub fn active_window(&self) -> Option<(String, String)> {
+            None
+        }
+        pub fn frame(&self) -> Option<Option<[i32; 4]>> {
             None
         }
         pub fn keys(&self) -> KeyBits {

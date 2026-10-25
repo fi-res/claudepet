@@ -19,6 +19,10 @@ const STATE_NAMES = {
   hang: "hanging from the edge of the screen",
   drag: "being dragged by the mouse",
   pet: "being petted",
+  draw: "painting a picture on a little easel",
+  coffee: "drinking coffee",
+  pizza: "eating a slice of pizza",
+  chase: "playing tag with the mouse cursor",
 };
 
 const DAY_PARTS = [
@@ -88,7 +92,10 @@ export class Brain {
       }
     }
     if (pet.music) lines.push("- Music is playing.");
-    lines.push(`- Clawd is ${STATE_NAMES[pet.state] || "busy with his own things"}.`);
+    lines.push(`- Clawd is ${STATE_NAMES[pet.state] || "busy with his own things"}${pet.onPlatform ? ", sitting on top of a window" : ""}.`);
+    const { mood, food } = pet.vitals;
+    const feeling = mood < 30 ? "sad and lonely" : mood > 80 ? "very happy" : "fine";
+    lines.push(`- Clawd feels ${feeling}${food < 25 ? " and is hungry" : ""}.`);
     const projects = [...pet.claudeSessions.values()].map((s) => s.project).filter(Boolean);
     if (projects.length) lines.push(`- Claude Code is working on a task in ${projects.join(", ")}.`);
     if (extra) lines.push(`- ${extra}`);
@@ -101,7 +108,7 @@ export class Brain {
     return this.invoke("claude_phrases", { context, count })
       .then((lines) => {
         this.available = true;
-        return lines;
+        return lines || [];
       })
       .catch((e) => {
         // Not installed or switched off: stop asking for a while.

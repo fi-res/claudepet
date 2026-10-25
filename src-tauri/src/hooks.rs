@@ -22,7 +22,9 @@ use crate::{
 
 pub const PORT: u16 = 47823;
 const MARKER: &str = "127.0.0.1:47823/hook/";
-const EVENTS: [&str; 5] = ["UserPromptSubmit", "PreToolUse", "Stop", "Notification", "SessionEnd"];
+const STATUS_MARKER: &str = "127.0.0.1:47823/status/";
+const EVENTS: [&str; 7] =
+    ["UserPromptSubmit", "PreToolUse", "Stop", "Notification", "SessionEnd", "SubagentStop", "StopFailure"];
 const MAX_BODY: usize = 8 << 20;
 const TRANSCRIPT_TAIL: u64 = 256 << 10;
 const THOUGHT_EVERY: Duration = Duration::from_secs(20);
@@ -37,6 +39,33 @@ pub enum ClaudeEvent {
     Stop { session: String, project: String },
     Report { session: String, project: String, text: String },
     End { session: String },
+    /// A subagent (Explore, Plan, ...) finished; the main session goes on.
+    Subagent { session: String, project: String, agent: String },
+    /// The turn ended because of an API error: rate limit, login, overload...
+    Failure { session: String, project: String, error: String },
+    /// Plan usage from the status line.
+    Limits { five_hour: Option<Window>, seven_day: Option<Window> },
+}
+
+/// One rate-limit window: percent used and when it resets (unix seconds).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Window {
+    pub used: f64,
+    pub resets_at: Option<u64>,
+}
+
+fn limit_window(v: &Value) -> Option<Window> {
+    let used = v.get("used_percentage")?.as_f64()?;
+    let resets_at = v.get("resets_at").and_then(|r| r.as_u64().or_else(|| r.as_f64().map(|f| f as u64)));
+    Some(Window { used, resets_at })
+}
+
+/// Reads `rate_limits` from Claude Code's status line input.
+pub fn parse_limits(body: &Value) -> Option<ClaudeEvent> {
+    let limits = body.get("rate_limits")?;
+    let five_hour = limits.get("five_hour").and_then(limit_window);
+    let seven_day = limits.get("seven_day").and_then(limit_window);
+    (five_hour.is_some() || seven_day.is_some()).then_some(ClaudeEvent::Limits { five_hour, seven_day })
 }
 
 struct Parsed {
@@ -107,6 +136,16 @@ fn parse(body: &Value, internal: &Path) -> Option<Parsed> {
         },
         "Stop" => ClaudeEvent::Stop { session, project },
         "SessionEnd" => ClaudeEvent::End { session },
+        "SubagentStop" => ClaudeEvent::Subagent { session, project, agent: str_field(body, "agent_type").to_string() },
+        "StopFailure" => {
+            // `error` is a short code like "rate_limit"; be lenient about its shape.
+            let error = match body.get("error") {
+                Some(Value::String(code)) => code.clone(),
+                Some(other) => str_field(other, "type").to_string(),
+                None => String::new(),
+            };
+            ClaudeEvent::Failure { session, project, error }
+        }
         _ => return None,
     };
     let transcript = Some(str_field(body, "transcript_path"))
@@ -192,6 +231,13 @@ impl Hub {
         }
     }
 
+    /// Status line updates carry the plan's usage limits.
+    pub fn status(&self, body: &Value) {
+        if let Some(limits) = parse_limits(body) {
+            (self.emit)(limits);
+        }
+    }
+
     pub fn handle(self: &Arc<Self>, body: &Value) {
         let Some(parsed) = parse(body, &self.haiku.workdir) else {
             return;
@@ -261,7 +307,13 @@ impl Hub {
 }
 
 /// Reads one HTTP request; returns its body if it is `POST /hook/<token>`.
-fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq)]
+enum Route {
+    Hook,
+    Status,
+}
+
+fn read_request(stream: &mut TcpStream, token: &str) -> Option<(Route, Vec<u8>)> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -282,7 +334,12 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
     let mut lines = head.lines();
     let mut request = lines.next()?.split_whitespace();
     let (method, path) = (request.next()?, request.next()?);
-    if method != "POST" || path != format!("/hook/{token}") {
+    let route = match path.strip_suffix(token) {
+        Some("/hook/") => Route::Hook,
+        Some("/status/") => Route::Status,
+        _ => return None,
+    };
+    if method != "POST" {
         return None;
     }
     let length: usize = lines
@@ -301,7 +358,7 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(length);
-    Some(body)
+    Some((route, body))
 }
 
 pub fn serve(token: String, hub: Arc<Hub>) -> std::io::Result<()> {
@@ -309,12 +366,15 @@ pub fn serve(token: String, hub: Arc<Hub>) -> std::io::Result<()> {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let body = read_request(&mut stream, &token);
-            let status = if body.is_some() { "204 No Content" } else { "404 Not Found" };
+            let request = read_request(&mut stream, &token);
+            let status = if request.is_some() { "204 No Content" } else { "404 Not Found" };
             let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             drop(stream);
-            if let Some(value) = body.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-                hub.handle(&value);
+            let Some((route, body)) = request else { continue };
+            let Ok(value) = serde_json::from_slice::<Value>(&body) else { continue };
+            match route {
+                Route::Hook => hub.handle(&value),
+                Route::Status => hub.status(&value),
             }
         }
     });
@@ -356,6 +416,47 @@ fn hook_command(token: &str) -> String {
     )
 }
 
+/// The status line hands its input (which has the plan limits) to Clawd and then
+/// on to the user's own status line command, if they had one.
+fn status_command(token: &str, original: Option<&str>) -> String {
+    let post =
+        format!("curl -s -m 1 -o /dev/null -H Content-Type:application/json --data-binary @- http://{STATUS_MARKER}{token}");
+    match original {
+        Some(cmd) => format!("input=$(cat); printf '%s' \"$input\" | {post}; printf '%s' \"$input\" | {{ {cmd}\n}}"),
+        None => format!("{post} || true"),
+    }
+}
+
+fn is_clawd_status(line: &Value) -> bool {
+    str_field(line, "command").contains(STATUS_MARKER)
+}
+
+/// Puts Clawd's status line in, keeping the user's own as a backup, or puts theirs
+/// back. Returns the backup to keep.
+fn with_status_line(settings: &mut Map<String, Value>, token: Option<&str>, backup: Option<Value>) -> Option<Value> {
+    let users = match settings.get("statusLine").cloned() {
+        Some(line) if is_clawd_status(&line) => backup,
+        other => other,
+    };
+    let Some(token) = token else {
+        match users {
+            Some(line) => settings.insert("statusLine".into(), line),
+            None => settings.remove("statusLine"),
+        };
+        return None;
+    };
+    let original = users
+        .as_ref()
+        .filter(|l| str_field(l, "type") == "command")
+        .map(|l| str_field(l, "command"))
+        .filter(|c| !c.is_empty());
+    let mut line = users.clone().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    line["type"] = json!("command");
+    line["command"] = json!(status_command(token, original));
+    settings.insert("statusLine".into(), line);
+    users
+}
+
 fn is_clawd_group(group: &Value) -> bool {
     group
         .get("hooks")
@@ -395,8 +496,10 @@ pub fn is_installed(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|s| s.contains(MARKER))
 }
 
-/// Adds (with a token) or removes Clawd's hooks, keeping everything else intact.
-pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
+/// Adds (with a token) or removes Clawd's hooks and status line, keeping everything
+/// else intact. `backup` is the user's own status line saved by an earlier install;
+/// returns the one to keep now. An unchanged file isn't rewritten.
+pub fn set_installed(path: &Path, token: Option<&str>, backup: Option<Value>) -> Result<Option<Value>, String> {
     let original = match fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -408,7 +511,13 @@ pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
         }
         _ => Value::Object(Map::new()),
     };
-    let updated = with_hooks(settings, token.map(hook_command).as_deref())?;
+    let mut updated = with_hooks(settings, token.map(hook_command).as_deref())?;
+    let root = updated.as_object_mut().ok_or("settings.json is not a JSON object")?;
+    let backup = with_status_line(root, token, backup);
+    let pretty = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())? + "\n";
+    if original.as_deref() == Some(pretty.as_str()) {
+        return Ok(backup);
+    }
     if let Some(text) = &original {
         let backup = path.with_extension("json.clawd-backup");
         if !backup.exists() {
@@ -419,9 +528,9 @@ pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.clawd-tmp");
-    let pretty = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())? + "\n";
     fs::write(&tmp, pretty).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(backup)
 }
 
 #[cfg(test)]
@@ -458,7 +567,7 @@ mod tests {
         let dir = temp_dir("broken");
         let path = dir.join("settings.json");
         fs::write(&path, "{ not json").unwrap();
-        assert!(set_installed(&path, Some("abc")).is_err());
+        assert!(set_installed(&path, Some("abc"), None).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
         assert!(!dir.join("settings.json.clawd-backup").exists());
     }
@@ -468,10 +577,10 @@ mod tests {
         let dir = temp_dir("install");
         let path = dir.join("settings.json");
         fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
-        set_installed(&path, Some("tok123")).unwrap();
+        assert_eq!(set_installed(&path, Some("tok123"), None).unwrap(), None);
         assert!(is_installed(&path));
         assert_eq!(fs::read_to_string(dir.join("settings.json.clawd-backup")).unwrap(), r#"{"theme":"dark"}"#);
-        set_installed(&path, None).unwrap();
+        set_installed(&path, None, None).unwrap();
         assert!(!is_installed(&path));
         let restored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restored, json!({"theme": "dark"}));
@@ -493,6 +602,55 @@ mod tests {
         assert!(parse(&own, internal).is_none());
         let bash = json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "cargo   test\n --all" } });
         assert!(matches!(parse(&bash, internal).unwrap().event, ClaudeEvent::Tool { detail, .. } if detail == "cargo test --all"));
+    }
+
+    #[test]
+    fn parses_subagents_failures_and_limits() {
+        let internal = Path::new("/x/haiku");
+        let sub = json!({ "hook_event_name": "SubagentStop", "session_id": "s", "cwd": "/p/app", "agent_type": "Explore" });
+        assert_eq!(
+            parse(&sub, internal).unwrap().event,
+            ClaudeEvent::Subagent { session: "s".into(), project: "app".into(), agent: "Explore".into() }
+        );
+        let fail = json!({ "hook_event_name": "StopFailure", "session_id": "s", "cwd": "/p/app", "error": "rate_limit" });
+        assert!(matches!(parse(&fail, internal).unwrap().event, ClaudeEvent::Failure { error, .. } if error == "rate_limit"));
+        let status = json!({ "rate_limits": {
+            "five_hour": { "used_percentage": 23.5, "resets_at": 1767225600 },
+            "seven_day": { "used_percentage": 41 }
+        }});
+        assert_eq!(
+            parse_limits(&status),
+            Some(ClaudeEvent::Limits {
+                five_hour: Some(Window { used: 23.5, resets_at: Some(1767225600) }),
+                seven_day: Some(Window { used: 41.0, resets_at: None }),
+            })
+        );
+        assert_eq!(parse_limits(&json!({ "model": {} })), None);
+    }
+
+    #[test]
+    fn status_line_wraps_the_users_own_and_gives_it_back() {
+        let users = json!({ "type": "command", "command": "~/bin/line.sh", "padding": 0 });
+        let mut settings = json!({ "statusLine": users.clone() });
+        let root = settings.as_object_mut().unwrap();
+        let backup = with_status_line(root, Some("tok"), None);
+        assert_eq!(backup, Some(users.clone()));
+        let command = str_field(&root["statusLine"], "command").to_string();
+        assert!(command.contains("/status/tok") && command.contains("~/bin/line.sh"));
+        assert_eq!(root["statusLine"]["padding"], 0);
+        // Installing again keeps the user's line, not a wrapper around the wrapper.
+        let again = with_status_line(root, Some("tok"), backup.clone());
+        assert_eq!(again, Some(users.clone()));
+        assert_eq!(str_field(&root["statusLine"], "command").matches("/status/").count(), 1);
+        assert_eq!(with_status_line(root, None, again), None);
+        assert_eq!(root["statusLine"], users);
+
+        let mut empty = json!({});
+        let root = empty.as_object_mut().unwrap();
+        assert_eq!(with_status_line(root, Some("tok"), None), None);
+        assert!(str_field(&root["statusLine"], "command").ends_with("|| true"));
+        with_status_line(root, None, None);
+        assert!(root.is_empty());
     }
 
     #[test]
@@ -530,7 +688,10 @@ mod tests {
         };
         send("/hook/secret");
         let (mut stream, _) = listener.accept().unwrap();
-        assert_eq!(read_request(&mut stream, "secret").as_deref(), Some(&br#"{"a":1}"#[..]));
+        assert!(read_request(&mut stream, "secret").is_some_and(|(r, b)| r == Route::Hook && b == br#"{"a":1}"#));
+        send("/status/secret");
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(read_request(&mut stream, "secret").is_some_and(|(r, _)| r == Route::Status));
         send("/hook/wrong");
         let (mut stream, _) = listener.accept().unwrap();
         assert!(read_request(&mut stream, "secret").is_none());

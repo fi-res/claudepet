@@ -4,16 +4,19 @@ mod audio;
 mod claude;
 mod context;
 mod hooks;
+mod reminders;
+mod screens;
 mod settings;
 mod shell;
 mod tray;
+mod update;
 
 use std::{
     fs,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
     thread,
     time::Duration,
@@ -23,16 +26,33 @@ use serde::Serialize;
 use tauri::{Emitter, Manager, State, WebviewWindow};
 
 use claude::Haiku;
-use settings::{Lang, Settings};
+use context::ContextEvent;
+use hooks::ClaudeEvent;
+use settings::{Lang, Memory, Settings, Vitals};
 
 pub const WINDOW: &str = "pet";
 const CURSOR_POLL: Duration = Duration::from_millis(16);
 const REFIT_EVERY: u32 = 120;
+const MAX_FACTS: usize = 8;
+const MAX_RECENT: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Serialize)]
 struct Cursor {
     x: f64,
     y: f64,
+}
+
+/// The top edge of the focused window, in the overlay's CSS pixels: Clawd can sit on it.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct Platform {
+    x: f64,
+    y: f64,
+    w: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Remind {
+    text: String,
 }
 
 pub struct AppState {
@@ -43,6 +63,10 @@ pub struct AppState {
     pub watching: Arc<AtomicBool>,
     pub token: String,
     idle_busy: AtomicBool,
+    /// The monitor the overlay is on; None means the primary one.
+    monitor: Mutex<Option<String>>,
+    pub tray: OnceLock<tray::Tray>,
+    pub update: Mutex<Option<tauri_plugin_updater::Update>>,
 }
 
 impl AppState {
@@ -51,6 +75,10 @@ impl AppState {
         let mut settings = self.settings.lock().unwrap();
         change(&mut settings);
         settings.save(&self.settings_path);
+    }
+
+    fn monitor(&self, window: &WebviewWindow) -> Option<tauri::Monitor> {
+        screens::current(window, self.monitor.lock().unwrap().as_deref())
     }
 }
 
@@ -92,7 +120,8 @@ async fn claude_chat(
 ) -> Result<claude::ChatReply, String> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let out = state.haiku.run_web(|lang| claude::chat_prompt(lang, &context, &history, &message))?;
+        let facts = state.settings.lock().unwrap().memory.facts.clone();
+        let out = state.haiku.run_web(|lang| claude::chat_prompt(lang, &context, &facts, &history, &message))?;
         claude::parse_chat(&out, 220).ok_or_else(|| "empty reply".to_string())
     })
     .await
@@ -114,29 +143,140 @@ fn focus_window(window: WebviewWindow) -> Result<(), String> {
     window.set_focus().map_err(|e| e.to_string())
 }
 
+/// Which sides of the current monitor lead to another one.
+#[tauri::command]
+fn monitor_layout(window: WebviewWindow, state: State<'_, Arc<AppState>>) -> Option<screens::Layout> {
+    state.monitor(&window).map(|m| screens::layout(&window, &m))
+}
+
+/// Moves the overlay to the monitor beside the current one, when Clawd walks off
+/// that side at height `y` (CSS pixels). None when there's no monitor there.
+#[tauri::command]
+fn cross_edge(window: WebviewWindow, state: State<'_, Arc<AppState>>, side: String, y: f64) -> Option<screens::Layout> {
+    let from = state.monitor(&window)?;
+    let origin = window.inner_position().ok()?;
+    let scale = window.scale_factor().ok()?;
+    let next = screens::neighbor(&window, &from, side == "right", f64::from(origin.y) + y * scale)?;
+    *state.monitor.lock().unwrap() = Some(screens::key(&next));
+    screens::fit(&window, &next).ok()?;
+    // Crossing into a monitor with another scale makes Windows resize the window
+    // on its own a moment later; fit it once more after that.
+    let (w, m) = (window.clone(), next.clone());
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        let _ = screens::fit(&w, &m);
+    });
+    Some(screens::layout(&window, &next))
+}
+
+/// Moves the overlay to the monitor under the mouse ("Call Clawd" in the tray).
+pub fn move_to_cursor_monitor(window: &WebviewWindow, state: &AppState) {
+    let Ok(cursor) = window.cursor_position() else {
+        return;
+    };
+    if let Some(monitor) = screens::at(window, cursor.x, cursor.y) {
+        *state.monitor.lock().unwrap() = Some(screens::key(&monitor));
+        let _ = screens::fit(window, &monitor);
+    }
+}
+
+#[tauri::command]
+fn get_vitals(state: State<'_, Arc<AppState>>) -> Option<Vitals> {
+    state.settings.lock().unwrap().vitals
+}
+
+#[tauri::command]
+fn save_vitals(state: State<'_, Arc<AppState>>, mood: f64, food: f64) {
+    let (mood, food) = (mood.clamp(0.0, 100.0), food.clamp(0.0, 100.0));
+    state.update(|s| s.vitals = Some(Vitals { mood, food, at: reminders::now() }));
+    tray::set_vitals(&state, mood, food);
+}
+
+/// Sets a reminder; returns when it goes off (unix seconds).
+#[tauri::command]
+fn add_reminder(state: State<'_, Arc<AppState>>, minutes: f64, text: String) -> u64 {
+    let at = reminders::add(&state, minutes, &text);
+    tray::refresh(&state);
+    at
+}
+
+#[tauri::command]
+fn clear_reminders(state: State<'_, Arc<AppState>>) -> usize {
+    let count = reminders::clear(&state);
+    tray::refresh(&state);
+    count
+}
+
+#[tauri::command]
+fn get_memory(state: State<'_, Arc<AppState>>) -> Memory {
+    state.settings.lock().unwrap().memory.clone()
+}
+
+/// Keeps a short fact for future chats; the oldest go when there are too many.
+#[tauri::command]
+fn remember(state: State<'_, Arc<AppState>>, fact: String) {
+    let fact = fact.trim().to_string();
+    if fact.is_empty() {
+        return;
+    }
+    state.update(|s| {
+        let facts = &mut s.memory.facts;
+        facts.retain(|f| !f.eq_ignore_ascii_case(&fact));
+        facts.push(fact);
+        let extra = facts.len().saturating_sub(MAX_FACTS);
+        facts.drain(..extra);
+    });
+}
+
+/// The last few chat turns, so a restart doesn't cut the conversation off.
+#[tauri::command]
+fn save_recent(state: State<'_, Arc<AppState>>, recent: Vec<[String; 2]>) {
+    let skip = recent.len().saturating_sub(MAX_RECENT);
+    state.update(|s| s.memory.recent = recent.into_iter().skip(skip).collect());
+}
+
+#[tauri::command]
+fn forget_memory(state: State<'_, Arc<AppState>>) {
+    state.update(|s| s.memory = Memory::default());
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     prepare_linux_env();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Starting Clawd again just calls the one that's already running.
+            if let Some(window) = app.get_webview_window(WINDOW) {
+                let _ = window.show();
+            }
+            let _ = app.emit_to(WINDOW, "recall", ());
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             set_click_through,
             get_language,
             claude_phrases,
             claude_chat,
             run_command,
-            focus_window
+            focus_window,
+            monitor_layout,
+            cross_edge,
+            get_vitals,
+            save_vitals,
+            add_reminder,
+            clear_reminders,
+            get_memory,
+            remember,
+            save_recent,
+            forget_memory
         ])
         .setup(|app| {
             let window = app
                 .get_webview_window(WINDOW)
                 .expect("pet window is declared in tauri.conf.json");
-            fit_to_work_area(&window)?;
-            // On Linux the native window must be realized (shown) before click-through can be set.
-            window.show()?;
-            window.set_ignore_cursor_events(true)?;
-            spawn_cursor_poller(window.clone());
 
             let data_dir = app.path().app_data_dir()?;
             let settings_path = app.path().app_config_dir()?.join("settings.json");
@@ -160,8 +300,19 @@ fn main() {
                 token: hooks::load_token(&data_dir),
                 idle_busy: AtomicBool::new(false),
                 settings: Mutex::new(settings),
+                monitor: Mutex::new(None),
+                tray: OnceLock::new(),
+                update: Mutex::new(None),
             });
             app.manage(state.clone());
+
+            if let Some(monitor) = state.monitor(&window) {
+                screens::fit(&window, &monitor)?;
+            }
+            // On Linux the native window must be realized (shown) before click-through can be set.
+            window.show()?;
+            window.set_ignore_cursor_events(true)?;
+            spawn_cursor_poller(window.clone(), state.clone());
 
             // Looking through the login shell can take a few seconds; don't hold up startup.
             let haiku = state.haiku.clone();
@@ -175,14 +326,36 @@ fn main() {
             let w = window.clone();
             audio::spawn(state.listening.clone(), move |e| send(&w, "audio", e));
             let w = window.clone();
-            context::spawn(state.watching.clone(), move |e| send(&w, "context", e));
-            let w = window.clone();
-            let hub = hooks::Hub::new(state.haiku.clone(), move |e| send(&w, "claude", e));
+            context::spawn(state.watching.clone(), move |e| match e {
+                ContextEvent::Frame { rect } => send(&w, "platform", localize(&w, rect)),
+                other => send(&w, "context", other),
+            });
+            let (w, s) = (window.clone(), state.clone());
+            let hub = hooks::Hub::new(state.haiku.clone(), move |e| {
+                if let ClaudeEvent::Limits { five_hour, seven_day } = &e {
+                    tray::set_limits(&s, five_hour.clone(), seven_day.clone());
+                }
+                send(&w, "claude", e);
+            });
             if let Err(e) = hooks::serve(state.token.clone(), hub) {
                 eprintln!("Claude Code hook endpoint unavailable: {e}");
             }
+            // Already linked: bring the hooks up to date with this version (new events,
+            // the status line for limits). An unchanged settings.json isn't touched.
+            if hooks::settings_path().is_some_and(|p| hooks::is_installed(&p)) {
+                if let Err(e) = tray::link_claude_code(&state, true) {
+                    eprintln!("Claude Code hooks: {e}");
+                }
+            }
 
-            tray::build(app, state)?;
+            let (w, s) = (window.clone(), state.clone());
+            reminders::spawn(state.clone(), move |r| {
+                send(&w, "remind", Remind { text: r.text.clone() });
+                tray::refresh(&s);
+            });
+
+            tray::build(app, state.clone())?;
+            update::spawn(app.handle().clone(), state);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -196,6 +369,18 @@ fn send<T: Serialize + Clone + std::fmt::Debug>(window: &WebviewWindow, event: &
         eprintln!("[{event}] {payload:?}");
     }
     let _ = window.emit_to(WINDOW, event, payload);
+}
+
+/// Converts a window frame in physical screen pixels into the overlay's CSS pixels.
+fn localize(window: &WebviewWindow, rect: Option<[i32; 4]>) -> Option<Platform> {
+    let [left, top, right, _] = rect?;
+    let origin = window.inner_position().ok()?;
+    let scale = window.scale_factor().ok()?;
+    Some(Platform {
+        x: f64::from(left - origin.x) / scale,
+        y: f64::from(top - origin.y) / scale,
+        w: f64::from(right - left) / scale,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -212,29 +397,9 @@ fn prepare_linux_env() {
     }
 }
 
-/// Stretch the overlay over the primary monitor, minus the taskbar/panels,
-/// so Clawd walks on top of the taskbar.
-fn fit_to_work_area(window: &WebviewWindow) -> tauri::Result<()> {
-    let monitor = match window.primary_monitor()? {
-        Some(m) => Some(m),
-        None => window.current_monitor()?,
-    };
-    let Some(monitor) = monitor else {
-        return Ok(());
-    };
-    let area = monitor.work_area();
-    if window.outer_position()? != area.position {
-        window.set_position(area.position)?;
-    }
-    if window.inner_size()? != area.size {
-        window.set_size(area.size)?;
-    }
-    Ok(())
-}
-
 /// The webview gets no mouse events while click-through is on, so feed it
 /// the global cursor position (in window-local CSS pixels) instead.
-fn spawn_cursor_poller(window: WebviewWindow) {
+fn spawn_cursor_poller(window: WebviewWindow, state: Arc<AppState>) {
     thread::spawn(move || {
         let mut last: Option<Cursor> = None;
         let mut ticks = 0u32;
@@ -245,7 +410,10 @@ fn spawn_cursor_poller(window: WebviewWindow) {
             }
             ticks = ticks.wrapping_add(1);
             if ticks.is_multiple_of(REFIT_EVERY) {
-                let _ = fit_to_work_area(&window);
+                // Resolution or taskbar changes, or Clawd's monitor was unplugged.
+                if let Some(monitor) = state.monitor(&window) {
+                    let _ = screens::fit(&window, &monitor);
+                }
             }
             let (Ok(cursor), Ok(origin), Ok(scale)) = (
                 window.cursor_position(),
