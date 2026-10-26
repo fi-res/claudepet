@@ -7,7 +7,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -22,7 +25,12 @@ use crate::{
 
 pub const PORT: u16 = 47823;
 const MARKER: &str = "127.0.0.1:47823/hook/";
-const EVENTS: [&str; 5] = ["UserPromptSubmit", "PreToolUse", "Stop", "Notification", "SessionEnd"];
+const STATUS_MARKER: &str = "127.0.0.1:47823/status/";
+const PERMISSION_MARKER: &str = "127.0.0.1:47823/permission/";
+/// How long Clawd's card waits for a click before Claude Code asks the usual way.
+const PERMISSION_WAIT: Duration = Duration::from_secs(60);
+const EVENTS: [&str; 7] =
+    ["UserPromptSubmit", "PreToolUse", "Stop", "Notification", "SessionEnd", "SubagentStop", "StopFailure"];
 const MAX_BODY: usize = 8 << 20;
 const TRANSCRIPT_TAIL: u64 = 256 << 10;
 const THOUGHT_EVERY: Duration = Duration::from_secs(20);
@@ -31,12 +39,94 @@ const THOUGHT_EVERY: Duration = Duration::from_secs(20);
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ClaudeEvent {
     Start { session: String, project: String },
-    Tool { session: String, project: String, tool: String, detail: String },
+    /// `background` is a shell command Claude started with run_in_background.
+    Tool { session: String, project: String, tool: String, detail: String, background: bool },
     Thought { session: String, text: String },
     Attention { session: String, project: String, message: String },
     Stop { session: String, project: String },
     Report { session: String, project: String, text: String },
     End { session: String },
+    /// A subagent (Explore, Plan, ...) finished; the main session goes on.
+    Subagent { session: String, project: String, agent: String },
+    /// The turn ended because of an API error: rate limit, login, overload...
+    Failure { session: String, project: String, error: String },
+    /// Plan usage from the status line.
+    Limits { five_hour: Option<Window>, seven_day: Option<Window> },
+    /// Claude Code wants to use a tool and asks the user: Clawd shows Allow / Deny.
+    Permission { id: u64, project: String, tool: String, detail: String, description: String },
+    /// That question was answered or timed out; the card goes away.
+    PermissionDone { id: u64 },
+}
+
+/// What a permission request is about: the full command, file or address.
+fn permission_detail(tool: &str, input: &Value) -> String {
+    let detail = match tool {
+        "Bash" | "PowerShell" => str_field(input, "command").to_string(),
+        "Read" | "Edit" | "MultiEdit" | "Write" => str_field(input, "file_path").to_string(),
+        "NotebookEdit" => str_field(input, "notebook_path").to_string(),
+        "WebFetch" => str_field(input, "url").to_string(),
+        "WebSearch" => str_field(input, "query").to_string(),
+        "Grep" | "Glob" => str_field(input, "pattern").to_string(),
+        _ => input.to_string(),
+    };
+    let detail = detail.trim();
+    match detail.char_indices().nth(600) {
+        Some((i, _)) => format!("{}…", &detail[..i]),
+        None => detail.to_string(),
+    }
+}
+
+/// The hook's answer to Claude Code: allow, or deny with a note for the model.
+fn permission_reply(allow: bool) -> Value {
+    let decision = if allow {
+        json!({ "behavior": "allow" })
+    } else {
+        json!({ "behavior": "deny", "message": "The user denied this from Clawd, the desktop pet." })
+    };
+    json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision } })
+}
+
+/// One rate-limit window: percent used and when it resets (unix seconds).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Window {
+    pub used: f64,
+    pub resets_at: Option<u64>,
+    /// When it resets as `/usage` words it ("Oct 26, 12:20am"), if there's no timestamp.
+    pub resets: Option<String>,
+}
+
+fn limit_window(v: &Value) -> Option<Window> {
+    let used = v.get("used_percentage")?.as_f64()?;
+    let resets_at = v.get("resets_at").and_then(|r| r.as_u64().or_else(|| r.as_f64().map(|f| f as u64)));
+    Some(Window { used, resets_at, resets: None })
+}
+
+/// One "Current …: 67% used · resets Oct 26, 12:20am (Europe/Moscow)" line of `/usage`.
+fn usage_line(text: &str, label: &str) -> Option<Window> {
+    let line = text.lines().map(str::trim).find(|l| l.starts_with(label))?;
+    let rest = line[label.len()..].trim_start_matches(':').trim();
+    let used: f64 = rest.split('%').next()?.trim().parse().ok()?;
+    let resets = rest
+        .split_once("resets")
+        .map(|(_, r)| r.trim())
+        .map(|r| r.split(" (").next().unwrap_or(r).trim().to_string())
+        .filter(|r| !r.is_empty());
+    Some(Window { used, resets_at: None, resets })
+}
+
+/// Reads the plan limits out of `claude -p /usage` output.
+pub fn parse_usage(text: &str) -> Option<ClaudeEvent> {
+    let five_hour = usage_line(text, "Current session");
+    let seven_day = usage_line(text, "Current week (all models)").or_else(|| usage_line(text, "Current week"));
+    (five_hour.is_some() || seven_day.is_some()).then_some(ClaudeEvent::Limits { five_hour, seven_day })
+}
+
+/// Reads `rate_limits` from Claude Code's status line input.
+pub fn parse_limits(body: &Value) -> Option<ClaudeEvent> {
+    let limits = body.get("rate_limits")?;
+    let five_hour = limits.get("five_hour").and_then(limit_window);
+    let seven_day = limits.get("seven_day").and_then(limit_window);
+    (five_hour.is_some() || seven_day.is_some()).then_some(ClaudeEvent::Limits { five_hour, seven_day })
 }
 
 struct Parsed {
@@ -64,6 +154,11 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
+/// Claude Code's shell tools: Bash everywhere, PowerShell on Windows.
+pub fn is_shell(tool: &str) -> bool {
+    matches!(tool, "Bash" | "PowerShell")
+}
+
 /// Short human description of what a tool call is about.
 fn tool_detail(tool: &str, input: &Value) -> String {
     let detail = match tool {
@@ -72,7 +167,7 @@ fn tool_detail(tool: &str, input: &Value) -> String {
             let path = if path.is_empty() { str_field(input, "notebook_path") } else { path };
             file_name(path)
         }
-        "Bash" => str_field(input, "command").to_string(),
+        "Bash" | "PowerShell" => str_field(input, "command").to_string(),
         "Grep" | "Glob" => str_field(input, "pattern").to_string(),
         "WebSearch" => str_field(input, "query").to_string(),
         "WebFetch" => {
@@ -82,7 +177,8 @@ fn tool_detail(tool: &str, input: &Value) -> String {
         "Task" | "Agent" => str_field(input, "description").to_string(),
         _ => String::new(),
     };
-    clip(&detail, 40)
+    // Commands are shown as a terminal block, so they can be longer than a file name.
+    clip(&detail, if is_shell(tool) { 160 } else { 40 })
 }
 
 fn parse(body: &Value, internal: &Path) -> Option<Parsed> {
@@ -97,8 +193,10 @@ fn parse(body: &Value, internal: &Path) -> Option<Parsed> {
         "UserPromptSubmit" => ClaudeEvent::Start { session, project },
         "PreToolUse" => {
             let tool = str_field(body, "tool_name").to_string();
-            let detail = tool_detail(&tool, body.get("tool_input").unwrap_or(&Value::Null));
-            ClaudeEvent::Tool { session, project, tool, detail }
+            let input = body.get("tool_input").unwrap_or(&Value::Null);
+            let detail = tool_detail(&tool, input);
+            let background = input.get("run_in_background").and_then(Value::as_bool).unwrap_or(false);
+            ClaudeEvent::Tool { session, project, tool, detail, background }
         }
         "Notification" => ClaudeEvent::Attention {
             session,
@@ -107,6 +205,16 @@ fn parse(body: &Value, internal: &Path) -> Option<Parsed> {
         },
         "Stop" => ClaudeEvent::Stop { session, project },
         "SessionEnd" => ClaudeEvent::End { session },
+        "SubagentStop" => ClaudeEvent::Subagent { session, project, agent: str_field(body, "agent_type").to_string() },
+        "StopFailure" => {
+            // `error` is a short code like "rate_limit"; be lenient about its shape.
+            let error = match body.get("error") {
+                Some(Value::String(code)) => code.clone(),
+                Some(other) => str_field(other, "type").to_string(),
+                None => String::new(),
+            };
+            ClaudeEvent::Failure { session, project, error }
+        }
         _ => return None,
     };
     let transcript = Some(str_field(body, "transcript_path"))
@@ -170,15 +278,57 @@ pub struct Hub {
     haiku: Arc<Haiku>,
     sessions: Mutex<HashMap<String, Session>>,
     emit: Box<dyn Fn(ClaudeEvent) + Send + Sync>,
+    /// Whether Claude Code's permission questions go to Clawd's card at all.
+    pub ask_permissions: AtomicBool,
+    pending: Mutex<HashMap<u64, mpsc::Sender<bool>>>,
+    next_id: AtomicU64,
 }
 
 impl Hub {
-    pub fn new(haiku: Arc<Haiku>, emit: impl Fn(ClaudeEvent) + Send + Sync + 'static) -> Arc<Self> {
+    pub fn new(haiku: Arc<Haiku>, ask_permissions: bool, emit: impl Fn(ClaudeEvent) + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             haiku,
             sessions: Mutex::new(HashMap::new()),
             emit: Box::new(emit),
+            ask_permissions: AtomicBool::new(ask_permissions),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
         })
+    }
+
+    /// Shows Clawd's Allow / Deny card and waits for a click. None means "no answer":
+    /// switched off, our own Haiku call, or nobody clicked in time.
+    fn ask_permission(&self, body: &Value) -> Option<bool> {
+        if !self.ask_permissions.load(Ordering::Relaxed) {
+            return None;
+        }
+        let cwd = str_field(body, "cwd");
+        if !cwd.is_empty() && Path::new(cwd).starts_with(&self.haiku.workdir) {
+            return None;
+        }
+        let tool = str_field(body, "tool_name").to_string();
+        let input = body.get("tool_input").unwrap_or(&Value::Null);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        (self.emit)(ClaudeEvent::Permission {
+            id,
+            project: file_name(cwd),
+            detail: permission_detail(&tool, input),
+            description: clip(str_field(input, "description"), 120),
+            tool,
+        });
+        let answer = rx.recv_timeout(PERMISSION_WAIT).ok();
+        self.pending.lock().unwrap().remove(&id);
+        (self.emit)(ClaudeEvent::PermissionDone { id });
+        answer
+    }
+
+    /// The user clicked Allow or Deny on card `id`.
+    pub fn answer_permission(&self, id: u64, allow: bool) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
+            let _ = tx.send(allow);
+        }
     }
 
     /// Runs Haiku if it's available and enabled; None means "fall back to plain text".
@@ -189,6 +339,18 @@ impl Hub {
                 eprintln!("haiku: {e}");
                 None
             }
+        }
+    }
+
+    /// Plan limits read some other way (`claude -p /usage`), passed on like the status line's.
+    pub fn limits(&self, event: ClaudeEvent) {
+        (self.emit)(event);
+    }
+
+    /// Status line updates carry the plan's usage limits.
+    pub fn status(&self, body: &Value) {
+        if let Some(limits) = parse_limits(body) {
+            (self.emit)(limits);
         }
     }
 
@@ -261,7 +423,14 @@ impl Hub {
 }
 
 /// Reads one HTTP request; returns its body if it is `POST /hook/<token>`.
-fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Route {
+    Hook,
+    Status,
+    Permission,
+}
+
+fn read_request(stream: &mut TcpStream, token: &str) -> Option<(Route, Vec<u8>)> {
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -282,7 +451,13 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
     let mut lines = head.lines();
     let mut request = lines.next()?.split_whitespace();
     let (method, path) = (request.next()?, request.next()?);
-    if method != "POST" || path != format!("/hook/{token}") {
+    let route = match path.strip_suffix(token) {
+        Some("/hook/") => Route::Hook,
+        Some("/status/") => Route::Status,
+        Some("/permission/") => Route::Permission,
+        _ => return None,
+    };
+    if method != "POST" {
         return None;
     }
     let length: usize = lines
@@ -301,7 +476,7 @@ fn read_request(stream: &mut TcpStream, token: &str) -> Option<Vec<u8>> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(length);
-    Some(body)
+    Some((route, body))
 }
 
 pub fn serve(token: String, hub: Arc<Hub>) -> std::io::Result<()> {
@@ -309,12 +484,32 @@ pub fn serve(token: String, hub: Arc<Hub>) -> std::io::Result<()> {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let body = read_request(&mut stream, &token);
-            let status = if body.is_some() { "204 No Content" } else { "404 Not Found" };
+            let request = read_request(&mut stream, &token);
+            // A permission question keeps the connection open until the user answers,
+            // so it gets its own thread; curl prints the reply for Claude Code to read.
+            if let Some((Route::Permission, body)) = &request {
+                let (hub, body) = (hub.clone(), body.clone());
+                thread::spawn(move || {
+                    let answer = serde_json::from_slice::<Value>(&body).ok().and_then(|v| hub.ask_permission(&v));
+                    let reply = answer.map(|allow| permission_reply(allow).to_string()).unwrap_or_default();
+                    let status = if reply.is_empty() { "204 No Content" } else { "200 OK" };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                });
+                continue;
+            }
+            let status = if request.is_some() { "204 No Content" } else { "404 Not Found" };
             let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             drop(stream);
-            if let Some(value) = body.and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-                hub.handle(&value);
+            let Some((route, body)) = request else { continue };
+            let Ok(value) = serde_json::from_slice::<Value>(&body) else { continue };
+            match route {
+                Route::Hook => hub.handle(&value),
+                Route::Status => hub.status(&value),
+                Route::Permission => {}
             }
         }
     });
@@ -356,25 +551,79 @@ fn hook_command(token: &str) -> String {
     )
 }
 
-fn is_clawd_group(group: &Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|hooks| hooks.iter().any(|h| str_field(h, "command").contains(MARKER)))
+/// Waits for the answer from Clawd's card and prints it for Claude Code. When Clawd
+/// isn't running or nobody clicks, it prints nothing and Claude Code asks as usual.
+fn permission_command(token: &str) -> String {
+    let wait = PERMISSION_WAIT.as_secs() + 5;
+    format!("curl -s -m {wait} -H Content-Type:application/json --data-binary @- http://{PERMISSION_MARKER}{token} || true")
 }
 
-/// Removes Clawd's hooks from settings and, given a command, adds fresh ones.
-fn with_hooks(mut settings: Value, command: Option<&str>) -> Result<Value, String> {
+/// The status line hands its input (which has the plan limits) to Clawd and then
+/// on to the user's own status line command, if they had one.
+fn status_command(token: &str, original: Option<&str>) -> String {
+    let post =
+        format!("curl -s -m 1 -o /dev/null -H Content-Type:application/json --data-binary @- http://{STATUS_MARKER}{token}");
+    match original {
+        Some(cmd) => format!("input=$(cat); printf '%s' \"$input\" | {post}; printf '%s' \"$input\" | {{ {cmd}\n}}"),
+        None => format!("{post} || true"),
+    }
+}
+
+fn is_clawd_status(line: &Value) -> bool {
+    str_field(line, "command").contains(STATUS_MARKER)
+}
+
+/// Puts Clawd's status line in, keeping the user's own as a backup, or puts theirs
+/// back. Returns the backup to keep.
+fn with_status_line(settings: &mut Map<String, Value>, token: Option<&str>, backup: Option<Value>) -> Option<Value> {
+    let users = match settings.get("statusLine").cloned() {
+        Some(line) if is_clawd_status(&line) => backup,
+        other => other,
+    };
+    let Some(token) = token else {
+        match users {
+            Some(line) => settings.insert("statusLine".into(), line),
+            None => settings.remove("statusLine"),
+        };
+        return None;
+    };
+    let original = users
+        .as_ref()
+        .filter(|l| str_field(l, "type") == "command")
+        .map(|l| str_field(l, "command"))
+        .filter(|c| !c.is_empty());
+    let mut line = users.clone().filter(Value::is_object).unwrap_or_else(|| json!({}));
+    line["type"] = json!("command");
+    line["command"] = json!(status_command(token, original));
+    settings.insert("statusLine".into(), line);
+    users
+}
+
+fn is_clawd_group(group: &Value) -> bool {
+    group.get("hooks").and_then(Value::as_array).is_some_and(|hooks| {
+        hooks.iter().any(|h| {
+            let command = str_field(h, "command");
+            command.contains(MARKER) || command.contains(PERMISSION_MARKER)
+        })
+    })
+}
+
+/// Removes Clawd's hooks from settings and, given the token, adds fresh ones.
+fn with_hooks(mut settings: Value, token: Option<&str>) -> Result<Value, String> {
     let root = settings.as_object_mut().ok_or("settings.json is not a JSON object")?;
     let hooks = root.entry("hooks").or_insert_with(|| Value::Object(Map::new()));
     let hooks = hooks.as_object_mut().ok_or("\"hooks\" in settings.json is not an object")?;
-    for event in EVENTS {
+    for event in EVENTS.iter().copied().chain(["PermissionRequest"]) {
         let groups = hooks.entry(event).or_insert_with(|| Value::Array(Vec::new()));
         let groups = groups.as_array_mut().ok_or(format!("hooks.{event} is not an array"))?;
         groups.retain(|g| !is_clawd_group(g));
-        if let Some(command) = command {
-            let hook = json!({ "type": "command", "command": command, "timeout": 5 });
-            let group = if event == "PreToolUse" {
+        if let Some(token) = token {
+            let hook = if event == "PermissionRequest" {
+                json!({ "type": "command", "command": permission_command(token), "timeout": PERMISSION_WAIT.as_secs() + 10 })
+            } else {
+                json!({ "type": "command", "command": hook_command(token), "timeout": 5 })
+            };
+            let group = if event == "PreToolUse" || event == "PermissionRequest" {
                 json!({ "matcher": "*", "hooks": [hook] })
             } else {
                 json!({ "hooks": [hook] })
@@ -395,8 +644,10 @@ pub fn is_installed(path: &Path) -> bool {
     fs::read_to_string(path).is_ok_and(|s| s.contains(MARKER))
 }
 
-/// Adds (with a token) or removes Clawd's hooks, keeping everything else intact.
-pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
+/// Adds (with a token) or removes Clawd's hooks and status line, keeping everything
+/// else intact. `backup` is the user's own status line saved by an earlier install;
+/// returns the one to keep now. An unchanged file isn't rewritten.
+pub fn set_installed(path: &Path, token: Option<&str>, backup: Option<Value>) -> Result<Option<Value>, String> {
     let original = match fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -408,7 +659,13 @@ pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
         }
         _ => Value::Object(Map::new()),
     };
-    let updated = with_hooks(settings, token.map(hook_command).as_deref())?;
+    let mut updated = with_hooks(settings, token)?;
+    let root = updated.as_object_mut().ok_or("settings.json is not a JSON object")?;
+    let backup = with_status_line(root, token, backup);
+    let pretty = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())? + "\n";
+    if original.as_deref() == Some(pretty.as_str()) {
+        return Ok(backup);
+    }
     if let Some(text) = &original {
         let backup = path.with_extension("json.clawd-backup");
         if !backup.exists() {
@@ -419,9 +676,9 @@ pub fn set_installed(path: &Path, token: Option<&str>) -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let tmp = path.with_extension("json.clawd-tmp");
-    let pretty = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())? + "\n";
     fs::write(&tmp, pretty).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(backup)
 }
 
 #[cfg(test)]
@@ -441,12 +698,13 @@ mod tests {
             "model": "opus",
             "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "notify-send done" }] }] }
         });
-        let installed = with_hooks(user.clone(), Some(&hook_command("abc"))).unwrap();
+        let installed = with_hooks(user.clone(), Some("abc")).unwrap();
         assert_eq!(installed["model"], "opus");
         assert_eq!(installed["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(installed["hooks"]["PreToolUse"][0]["matcher"], "*");
         // Reinstalling replaces rather than duplicates.
-        let again = with_hooks(installed, Some(&hook_command("def"))).unwrap();
+        assert!(str_field(&installed["hooks"]["PermissionRequest"][0]["hooks"][0], "command").contains("/permission/abc"));
+        let again = with_hooks(installed, Some("def")).unwrap();
         assert_eq!(again["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert!(again.to_string().contains("/hook/def") && !again.to_string().contains("/hook/abc"));
         assert_eq!(with_hooks(again, None).unwrap(), user);
@@ -458,7 +716,7 @@ mod tests {
         let dir = temp_dir("broken");
         let path = dir.join("settings.json");
         fs::write(&path, "{ not json").unwrap();
-        assert!(set_installed(&path, Some("abc")).is_err());
+        assert!(set_installed(&path, Some("abc"), None).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
         assert!(!dir.join("settings.json.clawd-backup").exists());
     }
@@ -468,10 +726,10 @@ mod tests {
         let dir = temp_dir("install");
         let path = dir.join("settings.json");
         fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
-        set_installed(&path, Some("tok123")).unwrap();
+        assert_eq!(set_installed(&path, Some("tok123"), None).unwrap(), None);
         assert!(is_installed(&path));
         assert_eq!(fs::read_to_string(dir.join("settings.json.clawd-backup")).unwrap(), r#"{"theme":"dark"}"#);
-        set_installed(&path, None).unwrap();
+        set_installed(&path, None, None).unwrap();
         assert!(!is_installed(&path));
         let restored: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restored, json!({"theme": "dark"}));
@@ -487,12 +745,134 @@ mod tests {
         let parsed = parse(&tool, internal).unwrap();
         assert_eq!(
             parsed.event,
-            ClaudeEvent::Tool { session: "s1".into(), project: "proj".into(), tool: "Edit".into(), detail: "main.rs".into() }
+            ClaudeEvent::Tool {
+                session: "s1".into(),
+                project: "proj".into(),
+                tool: "Edit".into(),
+                detail: "main.rs".into(),
+                background: false
+            }
         );
         let own = json!({ "hook_event_name": "Stop", "cwd": "/home/u/.local/share/clawd/haiku" });
         assert!(parse(&own, internal).is_none());
         let bash = json!({ "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "cargo   test\n --all" } });
         assert!(matches!(parse(&bash, internal).unwrap().event, ClaudeEvent::Tool { detail, .. } if detail == "cargo test --all"));
+        let ps = json!({
+            "hook_event_name": "PreToolUse", "tool_name": "PowerShell",
+            "tool_input": { "command": "Get-Date", "run_in_background": true }
+        });
+        assert!(matches!(
+            parse(&ps, internal).unwrap().event,
+            ClaudeEvent::Tool { detail, background: true, .. } if detail == "Get-Date"
+        ));
+    }
+
+    #[test]
+    fn parses_subagents_failures_and_limits() {
+        let internal = Path::new("/x/haiku");
+        let sub = json!({ "hook_event_name": "SubagentStop", "session_id": "s", "cwd": "/p/app", "agent_type": "Explore" });
+        assert_eq!(
+            parse(&sub, internal).unwrap().event,
+            ClaudeEvent::Subagent { session: "s".into(), project: "app".into(), agent: "Explore".into() }
+        );
+        let fail = json!({ "hook_event_name": "StopFailure", "session_id": "s", "cwd": "/p/app", "error": "rate_limit" });
+        assert!(matches!(parse(&fail, internal).unwrap().event, ClaudeEvent::Failure { error, .. } if error == "rate_limit"));
+        let status = json!({ "rate_limits": {
+            "five_hour": { "used_percentage": 23.5, "resets_at": 1767225600 },
+            "seven_day": { "used_percentage": 41 }
+        }});
+        assert_eq!(
+            parse_limits(&status),
+            Some(ClaudeEvent::Limits {
+                five_hour: Some(Window { used: 23.5, resets_at: Some(1767225600), resets: None }),
+                seven_day: Some(Window { used: 41.0, resets_at: None, resets: None }),
+            })
+        );
+        assert_eq!(parse_limits(&json!({ "model": {} })), None);
+    }
+
+    #[test]
+    fn reads_limits_from_usage_output() {
+        let text = "You are currently using your subscription to power your Claude Code usage\n\n\
+                    Current session: 67% used · resets Oct 26, 12:20am (Europe/Moscow)\n\
+                    Current week (all models): 80.5% used · resets Oct 30, 11pm (Europe/Moscow)\n\
+                    Current week (Sonnet only): 12% used\n";
+        assert_eq!(
+            parse_usage(text),
+            Some(ClaudeEvent::Limits {
+                five_hour: Some(Window { used: 67.0, resets_at: None, resets: Some("Oct 26, 12:20am".into()) }),
+                seven_day: Some(Window { used: 80.5, resets_at: None, resets: Some("Oct 30, 11pm".into()) }),
+            })
+        );
+        assert_eq!(parse_usage("Not logged in"), None);
+    }
+
+    #[test]
+    fn permission_replies_match_claude_codes_format() {
+        assert_eq!(permission_reply(true)["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        let deny = permission_reply(false);
+        assert_eq!(deny["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert_eq!(permission_detail("Bash", &json!({ "command": "  rm -rf build  " })), "rm -rf build");
+        assert_eq!(permission_detail("Edit", &json!({ "file_path": "/p/main.rs" })), "/p/main.rs");
+    }
+
+    #[test]
+    fn permission_waits_for_the_click() {
+        let (seen, sink) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)));
+        let haiku = Arc::new(Haiku {
+            workdir: PathBuf::from("/nowhere"),
+            cli: std::sync::RwLock::new(None),
+            lang: std::sync::RwLock::new(Lang::En),
+            enabled: AtomicBool::new(false),
+        });
+        let (log, slot) = (seen.clone(), sink.clone());
+        let hub = Hub::new(haiku, true, move |e| {
+            if let ClaudeEvent::Permission { id, .. } = &e {
+                *slot.lock().unwrap() = Some(*id);
+            }
+            log.lock().unwrap().push(e);
+        });
+        let asker = hub.clone();
+        let waiting = thread::spawn(move || {
+            asker.ask_permission(&json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "cwd": "/p/app" }))
+        });
+        let id = loop {
+            if let Some(id) = *sink.lock().unwrap() {
+                break id;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        hub.answer_permission(id, false);
+        assert_eq!(waiting.join().unwrap(), Some(false));
+        assert!(matches!(seen.lock().unwrap().last(), Some(ClaudeEvent::PermissionDone { .. })));
+        hub.ask_permissions.store(false, Ordering::Relaxed);
+        assert_eq!(hub.ask_permission(&json!({ "tool_name": "Bash" })), None);
+    }
+
+    #[test]
+    fn status_line_wraps_the_users_own_and_gives_it_back() {
+        let users = json!({ "type": "command", "command": "~/bin/line.sh", "padding": 0 });
+        let mut settings = json!({ "statusLine": users.clone() });
+        let root = settings.as_object_mut().unwrap();
+        let backup = with_status_line(root, Some("tok"), None);
+        assert_eq!(backup, Some(users.clone()));
+        let command = str_field(&root["statusLine"], "command").to_string();
+        assert!(command.contains("/status/tok") && command.contains("~/bin/line.sh"));
+        assert_eq!(root["statusLine"]["padding"], 0);
+        // Installing again keeps the user's line, not a wrapper around the wrapper.
+        let again = with_status_line(root, Some("tok"), backup.clone());
+        assert_eq!(again, Some(users.clone()));
+        assert_eq!(str_field(&root["statusLine"], "command").matches("/status/").count(), 1);
+        assert_eq!(with_status_line(root, None, again), None);
+        assert_eq!(root["statusLine"], users);
+
+        let mut empty = json!({});
+        let root = empty.as_object_mut().unwrap();
+        assert_eq!(with_status_line(root, Some("tok"), None), None);
+        assert!(str_field(&root["statusLine"], "command").ends_with("|| true"));
+        with_status_line(root, None, None);
+        assert!(root.is_empty());
     }
 
     #[test]
@@ -530,7 +910,10 @@ mod tests {
         };
         send("/hook/secret");
         let (mut stream, _) = listener.accept().unwrap();
-        assert_eq!(read_request(&mut stream, "secret").as_deref(), Some(&br#"{"a":1}"#[..]));
+        assert!(read_request(&mut stream, "secret").is_some_and(|(r, b)| r == Route::Hook && b == br#"{"a":1}"#));
+        send("/status/secret");
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(read_request(&mut stream, "secret").is_some_and(|(r, _)| r == Route::Status));
         send("/hook/wrong");
         let (mut stream, _) = listener.accept().unwrap();
         assert!(read_request(&mut stream, "secret").is_none());

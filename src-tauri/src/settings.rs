@@ -32,6 +32,29 @@ impl Lang {
     }
 }
 
+/// Clawd's tamagotchi needs, 0..=100, and when they were last saved (unix seconds).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Vitals {
+    pub mood: f64,
+    pub food: f64,
+    pub at: u64,
+}
+
+/// A reminder due at a unix time (seconds).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reminder {
+    pub at: u64,
+    pub text: String,
+}
+
+/// What Clawd keeps between chats: a few short facts and the last couple of turns.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Memory {
+    pub facts: Vec<String>,
+    pub recent: Vec<[String; 2]>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -40,6 +63,13 @@ pub struct Settings {
     pub listen: bool,
     pub watch: bool,
     pub llm: bool,
+    /// Claude Code's permission questions show up on Clawd's card.
+    pub ask_permissions: bool,
+    pub vitals: Option<Vitals>,
+    pub reminders: Vec<Reminder>,
+    pub memory: Memory,
+    /// The user's own Claude Code status line, put back when Clawd is unlinked.
+    pub statusline_backup: Option<serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -50,6 +80,11 @@ impl Default for Settings {
             listen: true,
             watch: true,
             llm: true,
+            ask_permissions: true,
+            vitals: None,
+            reminders: Vec::new(),
+            memory: Memory::default(),
+            statusline_backup: None,
         }
     }
 }
@@ -87,6 +122,11 @@ mod tests {
             listen: false,
             watch: true,
             llm: false,
+            ask_permissions: false,
+            vitals: Some(Vitals { mood: 50.0, food: 20.0, at: 1 }),
+            reminders: vec![Reminder { at: 2, text: "tea".into() }],
+            memory: Memory { facts: vec!["likes Rust".into()], recent: vec![["user".into(), "hi".into()]] },
+            statusline_backup: None,
         };
         settings.save(&path);
         assert_eq!(Settings::load(&path), settings);
